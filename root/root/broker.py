@@ -237,11 +237,14 @@ def _drain_gamepad_sockets() -> None:
 
 def _dir_size_bytes(path: Path) -> int:
     """Sum file sizes in a directory, excluding .last_accessed."""
-    return sum(
-        f.stat().st_size
-        for f in path.rglob("*")
-        if f.is_file() and f.name != ".last_accessed"
-    )
+    total = 0
+    for f in path.rglob("*"):
+        if f.is_file() and f.name != ".last_accessed":
+            try:
+                total += f.stat().st_size
+            except FileNotFoundError:
+                pass
+    return total
 
 
 def _cache_size_bytes() -> int:
@@ -261,10 +264,8 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
     if CACHE_MAX_GB <= 0:
         return
     max_bytes = int(CACHE_MAX_GB * 1024 ** 3)
-    while True:
-        current = _cache_size_bytes()
-        if current + needed_bytes <= max_bytes:
-            break
+    current = _cache_size_bytes()  # single upfront scan; updated incrementally
+    while current + needed_bytes > max_bytes:
         candidates = []
         for game_dir in CACHE_DIR.iterdir():
             if not game_dir.is_dir() or game_dir.name == active_stem:
@@ -272,14 +273,15 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
             la = game_dir / ".last_accessed"
             mtime = la.stat().st_mtime if la.exists() else 0
             size = _dir_size_bytes(game_dir)
-            candidates.append((mtime, -size, game_dir))  # oldest first; largest on access-time tie
+            candidates.append((mtime, -size, size, game_dir))  # oldest first; largest on access-time tie
         if not candidates:
             log.warning("Cache: no evictable games — proceeding anyway")
             break
         candidates.sort()
-        victim = candidates[0][2]
+        _, _, victim_size, victim = candidates[0]
         log.info("Cache: evicting %s (LRU)", victim.name)
         shutil.rmtree(victim)
+        current -= victim_size
 
 
 def _find_eboot(root: Path) -> Path | None:
@@ -304,20 +306,29 @@ def _extract_7z(archive_path: str, dest: Path) -> None:
     """Extract 7z archive to dest, parsing -bsp1 stdout for launch_progress (0–100)."""
     cmd = ["7z", "x", "-bsp1", "-y", archive_path, f"-o{dest}"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    buf = ""
-    while True:
-        chunk = proc.stdout.read(64)
-        if not chunk:
-            break
-        buf += chunk
-        parts = buf.split("\r")
-        buf = parts[-1]
-        for part in parts[:-1]:
-            m = re.search(r"(\d+)%", part)
+    try:
+        buf = ""
+        while True:
+            chunk = proc.stdout.read(64)
+            if not chunk:
+                break
+            buf += chunk
+            parts = buf.split("\r")
+            buf = parts[-1]
+            for part in parts[:-1]:
+                m = re.search(r"(\d+)%", part)
+                if m:
+                    with _lock:
+                        _session["launch_progress"] = int(m.group(1))
+        # drain any remaining buffer after EOF
+        if buf:
+            m = re.search(r"(\d+)%", buf)
             if m:
                 with _lock:
                     _session["launch_progress"] = int(m.group(1))
-    proc.wait()
+        proc.wait()
+    finally:
+        proc.stdout.close()
     if proc.returncode != 0:
         raise RuntimeError(f"7z exited with code {proc.returncode}")
 
