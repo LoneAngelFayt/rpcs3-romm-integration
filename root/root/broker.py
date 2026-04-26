@@ -335,9 +335,18 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
         current -= victim_size
 
 
-def _find_eboot(root: Path) -> Path | None:
-    """Walk extracted tree and return the first EBOOT.BIN found."""
+def _find_boot_target(root: Path) -> Path | None:
+    """Walk extracted tree and return the best boot target for rpcs3.
+
+    Priority:
+      1. EBOOT.BIN  — decrypted PS3 game directory (most common retail format)
+      2. *.iso      — PS3 disc image (rpcs3 --no-gui accepts ISO directly)
+
+    Returns None if neither is found.
+    """
     for path in root.rglob("EBOOT.BIN"):
+        return path
+    for path in root.rglob("*.iso"):
         return path
     return None
 
@@ -406,7 +415,7 @@ def _scan_cache() -> dict:
     for game_dir in CACHE_DIR.iterdir():
         if not game_dir.is_dir():
             continue
-        eboot = _find_eboot(game_dir)
+        eboot = _find_boot_target(game_dir)
         la = game_dir / ".last_accessed"
         result[game_dir.name] = {
             "path":          str(game_dir),
@@ -457,9 +466,9 @@ def _do_launch(rom_path: str) -> None:
 
     # Cache hit
     if game_dir.is_dir():
-        eboot = _find_eboot(game_dir)
+        eboot = _find_boot_target(game_dir)
         if eboot:
-            log.info("Cache hit: %s", stem)
+            log.info("Cache hit: %s (boot target: %s)", stem, eboot.name)
             _touch_last_accessed(game_dir)
             with _lock:
                 _session["rom_path"]        = rom_path
@@ -473,7 +482,7 @@ def _do_launch(rom_path: str) -> None:
             _launch_rpcs3_internal(str(eboot))
             _finish_launch()
             return
-        log.warning("Cache dir exists but no EBOOT.BIN — re-extracting")
+        log.warning("Cache dir exists but no boot target found — re-extracting")
         shutil.rmtree(game_dir)
 
     # LRU eviction
@@ -508,15 +517,16 @@ def _do_launch(rom_path: str) -> None:
             _session["launch_progress"] = None
         return
 
-    eboot = _find_eboot(game_dir)
-    if eboot is None:
-        log.error("No EBOOT.BIN found in %s", game_dir)
+    boot_target = _find_boot_target(game_dir)
+    if boot_target is None:
+        log.error("No boot target (EBOOT.BIN or .iso) found in %s", game_dir)
         shutil.rmtree(game_dir, ignore_errors=True)
         with _lock:
             _session["launch_status"]   = "error"
-            _session["launch_detail"]   = "No EBOOT.BIN found in archive"
+            _session["launch_detail"]   = "No EBOOT.BIN or .iso found in archive"
             _session["launch_progress"] = None
         return
+    eboot = boot_target
 
     _touch_last_accessed(game_dir)
 
