@@ -302,7 +302,7 @@ def _extract_zip(archive_path: str, dest: Path) -> None:
 
 def _extract_7z(archive_path: str, dest: Path) -> None:
     """Extract 7z archive to dest, parsing -bsp1 stdout for launch_progress (0–100)."""
-    cmd = ["7z", "x", f"-o{dest}", "-bsp1", "-y", archive_path]
+    cmd = ["7z", "x", "-bsp1", "-y", archive_path, f"-o{dest}"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     buf = ""
     while True:
@@ -401,8 +401,9 @@ def _do_launch(rom_path: str) -> None:
     # LRU eviction
     if CACHE_MAX_GB > 0:
         with _lock:
-            _session["launch_status"] = "evicting"
-            _session["launch_detail"] = "Freeing cache space…"
+            _session["launch_status"]   = "evicting"
+            _session["launch_detail"]   = "Freeing cache space…"
+            _session["launch_progress"] = None
         estimated = int(archive.stat().st_size * 1.1)
         _evict_lru(estimated, stem)
 
