@@ -6,7 +6,6 @@ import hmac
 import json
 import logging
 import os
-import re
 import shutil
 import signal
 import socket as _socket
@@ -345,6 +344,7 @@ def _find_eboot(root: Path) -> Path | None:
 
 def _extract_zip(archive_path: str, dest: Path) -> None:
     """Extract ZIP archive to dest, updating launch_progress (0–100) per file."""
+    log.info("Extracting %s (zip)", Path(archive_path).name)
     with _zipfile.ZipFile(archive_path) as zf:
         members = zf.infolist()
         total = max(len(members), 1)
@@ -355,34 +355,40 @@ def _extract_zip(archive_path: str, dest: Path) -> None:
 
 
 def _extract_7z(archive_path: str, dest: Path) -> None:
-    """Extract 7z archive to dest, parsing -bsp1 stdout for launch_progress (0–100)."""
-    cmd = ["7z", "x", "-bsp1", "-y", archive_path, f"-o{dest}"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    """Extract 7z/rar archive; poll output-dir size for launch_progress.
+
+    7z suppresses its progress output when stdout is not a TTY, so parsing
+    -bsp1 stdout is unreliable.  Instead we run 7z with all output discarded
+    and track progress by comparing the growing output directory to an
+    estimated uncompressed total (compressed × 3 — conservative for PS3 games).
+    Progress is reported 0–99 during extraction; the caller sets 100 on success.
+    """
+    archive = Path(archive_path)
+    log.info("Extracting %s", archive.name)
+    cmd = ["7z", "x", "-y", archive_path, f"-o{dest}"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     try:
-        buf = ""
-        while True:
-            chunk = proc.stdout.read(64)
-            if not chunk:
-                break
-            buf += chunk
-            parts = buf.split("\r")
-            buf = parts[-1]
-            for part in parts[:-1]:
-                m = re.search(r"(\d+)%", part)
-                if m:
-                    with _lock:
-                        _session["launch_progress"] = int(m.group(1))
-        # drain any remaining buffer after EOF
-        if buf:
-            m = re.search(r"(\d+)%", buf)
-            if m:
-                with _lock:
-                    _session["launch_progress"] = int(m.group(1))
-        proc.wait()
-    finally:
-        proc.stdout.close()
+        est_total = max(1, int(archive.stat().st_size * 3))
+    except OSError:
+        est_total = 1
+
+    while proc.poll() is None:
+        try:
+            r = subprocess.run(
+                ["du", "-sb", str(dest)],
+                capture_output=True, text=True, timeout=10,
+            )
+            extracted = int(r.stdout.split()[0]) if r.returncode == 0 else 0
+        except Exception:
+            extracted = 0
+        with _lock:
+            _session["launch_progress"] = min(99, int(extracted / est_total * 100))
+        time.sleep(3)
+
     if proc.returncode != 0:
         raise RuntimeError(f"7z exited with code {proc.returncode}")
+    log.info("Extraction complete: %s", archive.name)
 
 
 def _scan_cache() -> dict:
@@ -679,8 +685,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     and _session["process"].poll() is None
                 )
                 snap = dict(_session)
-            cache = _scan_cache()
-            total_bytes = sum(g["size_bytes"] for g in cache.values())
+            # Cache stats are omitted here — use GET /cache for that.
+            # Scanning the cache dir on every 2-second status poll is expensive
+            # (rglob across a directory that may be actively written during extraction).
             self._send_json(200, {
                 "active":          active,
                 "rom_path":        snap["rom_path"],
@@ -690,11 +697,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "launch_status":   snap["launch_status"],
                 "launch_detail":   snap["launch_detail"],
                 "launch_progress": snap["launch_progress"],
-                "cache": {
-                    "used_gb":    round(total_bytes / 1024 ** 3, 2),
-                    "max_gb":     CACHE_MAX_GB,
-                    "game_count": len(cache),
-                },
             })
             return
 
