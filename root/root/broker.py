@@ -231,3 +231,225 @@ def _drain_gamepad_sockets() -> None:
         "Socket drain: EOF to %d, removed %d (of %d total).",
         drained, removed, len(paths),
     )
+
+
+# ── Archive cache manager ─────────────────────────────────────────────────────
+
+def _dir_size_bytes(path: Path) -> int:
+    """Sum file sizes in a directory, excluding .last_accessed."""
+    return sum(
+        f.stat().st_size
+        for f in path.rglob("*")
+        if f.is_file() and f.name != ".last_accessed"
+    )
+
+
+def _cache_size_bytes() -> int:
+    if not CACHE_DIR.is_dir():
+        return 0
+    return sum(_dir_size_bytes(d) for d in CACHE_DIR.iterdir() if d.is_dir())
+
+
+def _touch_last_accessed(game_dir: Path) -> None:
+    (game_dir / ".last_accessed").write_text(
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    )
+
+
+def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
+    """Evict least-recently-used games until needed_bytes fit within CACHE_MAX_GB."""
+    if CACHE_MAX_GB <= 0:
+        return
+    max_bytes = int(CACHE_MAX_GB * 1024 ** 3)
+    while True:
+        current = _cache_size_bytes()
+        if current + needed_bytes <= max_bytes:
+            break
+        candidates = []
+        for game_dir in CACHE_DIR.iterdir():
+            if not game_dir.is_dir() or game_dir.name == active_stem:
+                continue
+            la = game_dir / ".last_accessed"
+            mtime = la.stat().st_mtime if la.exists() else 0
+            size = _dir_size_bytes(game_dir)
+            candidates.append((mtime, -size, game_dir))  # oldest first; largest on access-time tie
+        if not candidates:
+            log.warning("Cache: no evictable games — proceeding anyway")
+            break
+        candidates.sort()
+        victim = candidates[0][2]
+        log.info("Cache: evicting %s (LRU)", victim.name)
+        shutil.rmtree(victim)
+
+
+def _find_eboot(root: Path) -> Path | None:
+    """Walk extracted tree and return the first EBOOT.BIN found."""
+    for path in root.rglob("EBOOT.BIN"):
+        return path
+    return None
+
+
+def _extract_zip(archive_path: str, dest: Path) -> None:
+    """Extract ZIP archive to dest, updating launch_progress (0–100) per file."""
+    with _zipfile.ZipFile(archive_path) as zf:
+        members = zf.infolist()
+        total = max(len(members), 1)
+        for i, member in enumerate(members):
+            zf.extract(member, dest)
+            with _lock:
+                _session["launch_progress"] = int((i + 1) / total * 100)
+
+
+def _extract_7z(archive_path: str, dest: Path) -> None:
+    """Extract 7z archive to dest, parsing -bsp1 stdout for launch_progress (0–100)."""
+    cmd = ["7z", "x", f"-o{dest}", "-bsp1", "-y", archive_path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    buf = ""
+    while True:
+        chunk = proc.stdout.read(64)
+        if not chunk:
+            break
+        buf += chunk
+        parts = buf.split("\r")
+        buf = parts[-1]
+        for part in parts[:-1]:
+            m = re.search(r"(\d+)%", part)
+            if m:
+                with _lock:
+                    _session["launch_progress"] = int(m.group(1))
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"7z exited with code {proc.returncode}")
+
+
+def _scan_cache() -> dict:
+    """Return cache inventory: {stem: {path, eboot, size_bytes, last_accessed}}."""
+    result = {}
+    if not CACHE_DIR.is_dir():
+        return result
+    for game_dir in CACHE_DIR.iterdir():
+        if not game_dir.is_dir():
+            continue
+        eboot = _find_eboot(game_dir)
+        la = game_dir / ".last_accessed"
+        result[game_dir.name] = {
+            "path":          str(game_dir),
+            "eboot":         str(eboot) if eboot else None,
+            "size_bytes":    _dir_size_bytes(game_dir),
+            "last_accessed": la.read_text().strip() if la.exists() else None,
+        }
+    return result
+
+
+# ── Launch flow ───────────────────────────────────────────────────────────────
+
+def _wait_for_rpcs3_window(timeout: float) -> bool:
+    """Poll until rpcs3 process is running or timeout. Returns True if found."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            subprocess.check_output(["pgrep", "-x", "rpcs3"], text=True)
+            return True
+        except subprocess.CalledProcessError:
+            pass
+        time.sleep(1.0)
+    return False
+
+
+def _finish_launch() -> None:
+    """Wait for rpcs3 process to appear, then mark session as running."""
+    if _wait_for_rpcs3_window(RPCS3_BOOT_TIMEOUT):
+        log.info("rpcs3 window detected — marking running")
+    else:
+        log.warning("rpcs3 not detected within %.0fs — marking running anyway", RPCS3_BOOT_TIMEOUT)
+    with _lock:
+        _session["launch_status"] = "running"
+        _session["launch_detail"] = None
+
+
+def _do_launch(rom_path: str) -> None:
+    """Background thread: kill current rpcs3, evict LRU, extract archive, launch."""
+    archive = Path(rom_path)
+    stem = archive.stem
+    game_dir = CACHE_DIR / stem
+
+    # Kill before extraction so stream shows progress overlay, not stale game
+    _kill_rpcs3()
+    _drain_gamepad_sockets()
+
+    # Cache hit
+    if game_dir.is_dir():
+        eboot = _find_eboot(game_dir)
+        if eboot:
+            log.info("Cache hit: %s", stem)
+            _touch_last_accessed(game_dir)
+            with _lock:
+                _session["rom_path"]        = rom_path
+                _session["rom_name"]        = stem
+                _session["eboot_path"]      = str(eboot)
+                _session["started_at"]      = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                _session["launch_status"]   = "launching"
+                _session["launch_detail"]   = "Starting rpcs3…"
+                _session["launch_progress"] = None
+            time.sleep(1)
+            _launch_rpcs3_internal(str(eboot))
+            _finish_launch()
+            return
+        log.warning("Cache dir exists but no EBOOT.BIN — re-extracting")
+        shutil.rmtree(game_dir)
+
+    # LRU eviction
+    if CACHE_MAX_GB > 0:
+        with _lock:
+            _session["launch_status"] = "evicting"
+            _session["launch_detail"] = "Freeing cache space…"
+        estimated = int(archive.stat().st_size * 1.1)
+        _evict_lru(estimated, stem)
+
+    # Extraction
+    with _lock:
+        _session["launch_status"]   = "extracting"
+        _session["launch_detail"]   = "Extracting game files…"
+        _session["launch_progress"] = 0
+
+    game_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if archive.suffix.lower() == ".zip":
+            _extract_zip(rom_path, game_dir)
+        else:
+            _extract_7z(rom_path, game_dir)
+        with _lock:
+            _session["launch_progress"] = 100
+    except Exception as exc:
+        log.error("Extraction failed: %s", exc)
+        shutil.rmtree(game_dir, ignore_errors=True)
+        with _lock:
+            _session["launch_status"]   = "error"
+            _session["launch_detail"]   = f"Extraction failed: {exc}"
+            _session["launch_progress"] = None
+        return
+
+    eboot = _find_eboot(game_dir)
+    if eboot is None:
+        log.error("No EBOOT.BIN found in %s", game_dir)
+        shutil.rmtree(game_dir, ignore_errors=True)
+        with _lock:
+            _session["launch_status"]   = "error"
+            _session["launch_detail"]   = "No EBOOT.BIN found in archive"
+            _session["launch_progress"] = None
+        return
+
+    _touch_last_accessed(game_dir)
+
+    with _lock:
+        _session["rom_path"]        = rom_path
+        _session["rom_name"]        = stem
+        _session["eboot_path"]      = str(eboot)
+        _session["started_at"]      = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _session["launch_status"]   = "launching"
+        _session["launch_detail"]   = "Starting rpcs3…"
+        _session["launch_progress"] = None
+
+    time.sleep(1)
+    _launch_rpcs3_internal(str(eboot))
+    _finish_launch()
