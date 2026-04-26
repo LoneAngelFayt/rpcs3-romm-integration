@@ -343,15 +343,22 @@ def _find_eboot(root: Path) -> Path | None:
 
 
 def _extract_zip(archive_path: str, dest: Path) -> None:
-    """Extract ZIP archive to dest, updating launch_progress (0–100) per file."""
+    """Extract ZIP archive; track launch_progress by uncompressed bytes (0–99).
+
+    Uses ZipInfo.file_size (uncompressed) so progress is proportional to data
+    written rather than file count — accurate even when one file dominates.
+    """
     log.info("Extracting %s (zip)", Path(archive_path).name)
     with _zipfile.ZipFile(archive_path) as zf:
         members = zf.infolist()
-        total = max(len(members), 1)
-        for i, member in enumerate(members):
+        total_bytes = max(1, sum(m.file_size for m in members))
+        done_bytes = 0
+        for member in members:
             zf.extract(member, dest)
+            done_bytes += member.file_size
             with _lock:
-                _session["launch_progress"] = int((i + 1) / total * 100)
+                _session["launch_progress"] = min(99, int(done_bytes / total_bytes * 100))
+    log.info("Extraction complete: %s", Path(archive_path).name)
 
 
 def _extract_7z(archive_path: str, dest: Path) -> None:
