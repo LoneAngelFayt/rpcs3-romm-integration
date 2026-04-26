@@ -630,7 +630,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> dict:
         try:
-            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
         except ValueError:
             length = 0
         if length == 0:
@@ -807,7 +807,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/mute":
             body = self._read_body()
-            mute_arg = "1" if body.get("mute") else ("0" if "mute" in body else "toggle")
+            mute_val = body.get("mute", None)
+            if "mute" not in body:
+                mute_arg = "toggle"
+            elif mute_val is True:
+                mute_arg = "1"
+            elif mute_val is False:
+                mute_arg = "0"
+            else:
+                self._send_json(400, {"error": "mute must be a boolean"})
+                return
             result = _pactl("set-sink-mute", "@DEFAULT_SINK@", mute_arg)
             if result.returncode != 0:
                 self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
@@ -837,7 +846,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if game_name == active_stem:
                 self._send_json(409, {"error": "cannot evict active game"})
                 return
-            game_dir = CACHE_DIR / game_name
+            game_dir = (CACHE_DIR / game_name).resolve()
+            if not str(game_dir).startswith(str(CACHE_DIR.resolve()) + "/"):
+                self._send_json(400, {"error": "invalid game name"})
+                return
             if not game_dir.is_dir():
                 self._send_json(404, {"error": "game not in cache"})
                 return
@@ -858,7 +870,7 @@ def main():
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    result = subprocess.run(["pkill", "-9", "-f", "rpcs3"], capture_output=True)
+    result = subprocess.run(["pkill", "-9", "-x", "rpcs3"], capture_output=True)
     if result.returncode == 0:
         log.info("Killed stale rpcs3 instance(s) on startup.")
         time.sleep(2)
