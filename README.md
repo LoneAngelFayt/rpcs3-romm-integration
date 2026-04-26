@@ -8,7 +8,7 @@ Enables RomM to launch PS3 games from ZIP or 7z archives, manage save states, an
 
 rpcs3 requires firmware before games will run. **On first launch, open the container's web interface and install the PS3 firmware:**
 
-- Configuration → Install Firmware (requires `PS3UPDAT.PUP`)
+- Configuration → Install Firmware (requires `PS3UPDAT.PUP` — download from [PlayStation's system software page](https://www.playstation.com/en-us/support/hardware/ps3/system-software/))
 
 Once firmware is installed, rpcs3 is ready to launch games via RomM. Controller mapping and display settings can be adjusted through the rpcs3 UI.
 
@@ -96,6 +96,7 @@ After calling `POST /launch`, poll `GET /status` every 2 seconds. The `launch_st
 | `"extracting"` | `0–100` | Progress bar — "Extracting game files… (45%)" |
 | `"launching"` | `null` | Spinner — "Starting rpcs3…" |
 | `"running"` | `null` | Stream view |
+| `"saving"` | `null` | Spinner — "Saving game…" |
 | `"error"` | `null` | Error — show `launch_detail` |
 
 Cached games skip extraction and go directly to launching. First launch of a large game can take 1–5 minutes while the archive extracts.
@@ -110,17 +111,18 @@ In-game saves (`/config/dev_hdd0/`) and save states (`/config/savestates/`) are 
 
 ## Save States
 
-rpcs3 has one save state slot per game. `/save-state` sends Ctrl+S and polls the save state directory for up to `SAVE_WAIT` seconds to confirm the write. `/load-state` sends Ctrl+R (fire-and-forget — rpcs3 loads immediately).
+rpcs3 has one save state slot per game. `/save-state` sends Ctrl+S and polls the save state directory for up to `SAVE_WAIT` seconds to confirm the write, then returns `{"status": "saving"}` immediately. **HTTP 200 from `/save-state` means the keypress was delivered — not that the write completed.** Poll `/status` until `launch_status` returns to `"running"` to confirm the save finished. `/load-state` sends Ctrl+R (fire-and-forget — rpcs3 loads immediately).
 
-Save states are stored as `<TITLEID>.savestate` files in `SAVE_DIR`. They persist across cache evictions and container restarts.
+Save states are stored as `<TITLEID>.savestate` files in `SAVE_DIR` (default `/config/savestates/`). They persist across cache evictions and container restarts as long as the `/config` volume is persisted.
 
 ## Architecture
 
 ```
 init-rpcs3-config (S6 oneshot)
+  └── Clean stale display sockets (wayland-*, .X11-unix)
   └── Install missing packages (python3, xdotool, p7zip-full, unzip)
   └── Disable labwc autostart — broker owns rpcs3 lifecycle
-  └── Seed rpcs3 config.yml (fullscreen, no confirm-shutdown)
+  └── Seed rpcs3 config.yml if it exists (fullscreen, no confirm-shutdown)
   └── Create and chown cache directory
 
 svc-broker (S6 longrun) → broker.py
@@ -159,3 +161,6 @@ The selkies joystick interposer requires an active streaming session before rpcs
 
 **rpcs3 firmware not installed**
 If rpcs3 shows a firmware error on launch, open the container's web interface and install the PS3 firmware via Configuration → Install Firmware.
+
+**Write endpoints accessible without authentication**
+If `BROKER_SECRET` is unset, all POST and DELETE endpoints accept requests from any source. When port 8000 is exposed, set `BROKER_SECRET` to prevent unauthorized game launches or cache operations.
