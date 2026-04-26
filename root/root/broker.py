@@ -71,6 +71,8 @@ log = logging.getLogger("broker")
 # ── Session state ─────────────────────────────────────────────────────────────
 
 _lock = Lock()
+_crash_count = 0          # rapid-crash counter; resets on any launch lasting > 10s
+_MAX_CRASHES  = 5         # stop auto-relaunching after this many rapid crashes
 _session: dict = {
     "process":          None,
     "rom_path":         None,
@@ -142,6 +144,7 @@ def _kill_rpcs3() -> None:
 
 def _launch_rpcs3_internal(eboot_path: str | None) -> None:
     """Spawn rpcs3 as abc. Does not kill any existing instance — caller must do that."""
+    global _crash_count
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
@@ -154,9 +157,10 @@ def _launch_rpcs3_internal(eboot_path: str | None) -> None:
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             preexec_fn=os.setpgrp,
+            text=True,
         )
     except Exception as exc:
         log.error("Failed to launch rpcs3: %s", exc)
@@ -168,14 +172,30 @@ def _launch_rpcs3_internal(eboot_path: str | None) -> None:
     with _lock:
         _session["process"] = proc
         _session["is_managed"] = True
+        _crash_count = 0
     log.info("rpcs3 launched (PID %d)", proc.pid)
+    Thread(target=_log_rpcs3_output, args=(proc,), daemon=True).start()
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
+
+
+def _log_rpcs3_output(proc) -> None:
+    """Forward rpcs3 stdout/stderr lines to the broker log."""
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log.info("[rpcs3] %s", line)
+    except Exception:
+        pass
 
 
 def _monitor_process(proc, start_time: float) -> None:
     """Relaunch to library on unexpected rpcs3 exit."""
+    global _crash_count
     proc.wait()
     duration = time.monotonic() - start_time
+    exit_code = proc.returncode
+    log.info("rpcs3 exited (code=%s) after %.1fs", exit_code, duration)
 
     with _lock:
         should_relaunch = _session["is_managed"] and _session["process"] is proc
@@ -183,8 +203,29 @@ def _monitor_process(proc, start_time: float) -> None:
     if not should_relaunch:
         return
 
-    wait_time = 5 if duration < 5 else 1
-    log.info("rpcs3 exited after %.1fs — relaunching library in %ds", duration, wait_time)
+    rapid = duration < 10
+    if rapid:
+        _crash_count += 1
+    else:
+        _crash_count = 0
+
+    if _crash_count >= _MAX_CRASHES:
+        log.error(
+            "rpcs3 crashed %d times rapidly — stopping auto-relaunch. "
+            "Check firmware installation and container logs.",
+            _crash_count,
+        )
+        with _lock:
+            _session["is_managed"]   = False
+            _session["launch_status"] = "error"
+            _session["launch_detail"] = (
+                f"rpcs3 crashed {_crash_count} times rapidly — "
+                "check firmware and container logs"
+            )
+        return
+
+    wait_time = 5 if rapid else 1
+    log.info("rpcs3 exited after %.1fs — relaunching library in %ds (crash #%d)", duration, wait_time, _crash_count)
     time.sleep(wait_time)
 
     with _lock:
