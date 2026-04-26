@@ -148,7 +148,7 @@ def _launch_rpcs3_internal(eboot_path: str | None) -> None:
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
-        "rpcs3", "--no-gui",
+        "/opt/rpcs3/AppRun", "--no-gui",
     ]
     if eboot_path:
         cmd.append(eboot_path)
