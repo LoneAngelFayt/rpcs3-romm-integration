@@ -14,7 +14,7 @@ Once firmware is installed, rpcs3 is ready to launch games via RomM. Controller 
 
 ## Game Archive Format
 
-Store PS3 games as `.zip` or `.7z` archives in your RomM library. The archive must contain the game folder with `EBOOT.BIN` somewhere inside (the broker finds it automatically regardless of folder depth).
+Store PS3 games as `.zip`, `.7z`, or `.rar` archives in your RomM library. The archive must contain the game folder with `EBOOT.BIN` somewhere inside (the broker finds it automatically regardless of folder depth).
 
 To create an archive from a game folder:
 ```bash
@@ -23,9 +23,12 @@ zip -r "Demon_Souls.zip" "Demon_Souls/"
 
 # 7z (30–50% smaller, recommended)
 7z a "Demon_Souls.7z" "Demon_Souls/"
+
+# RAR (if you already have .rar archives from other sources)
+# Extraction is handled automatically — no conversion needed
 ```
 
-Both formats report extraction progress (0–100%) to the RomM frontend. 7z is recommended for new archives — it typically saves 5–15 GB per game.
+All three formats report extraction progress (0–100%) to the RomM frontend. 7z is recommended for new archives — it typically saves 5–15 GB per game. RAR archives are extracted via p7zip and behave identically to .7z at runtime.
 
 ## Usage
 
@@ -77,7 +80,7 @@ All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is 
 | `/health` | GET | — | `{"status": "ok"}` |
 | `/status` | GET | — | Session state, cache info, and launch progress |
 | `/cache` | GET | — | List cached games with sizes and last-accessed times |
-| `/launch` | POST | `{"rom_path": "..."}` | Extract archive (if needed) and launch game |
+| `/launch` | POST | `{"rom_path": "..."}` | Extract archive (.zip/.7z/.rar) if needed and launch game |
 | `/launch` | DELETE | — | Kill game, return to rpcs3 library view |
 | `/save-state` | POST | — | Send Ctrl+S to rpcs3 |
 | `/load-state` | POST | — | Send Ctrl+R to rpcs3 |

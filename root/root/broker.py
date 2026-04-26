@@ -93,7 +93,7 @@ def _validate_rom_path(raw: str) -> Path | None:
         return None
     if not p.is_relative_to(ROM_ROOT):
         return None
-    if p.suffix.lower() not in (".zip", ".7z"):
+    if p.suffix.lower() not in (".zip", ".7z", ".rar"):
         return None
     return p
 
@@ -721,7 +721,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             rom_path = _validate_rom_path(raw_path)
             if rom_path is None:
                 self._send_json(400, {
-                    "error": "rom_path must be within ROM_ROOT and end in .zip or .7z",
+                    "error": "rom_path must be within ROM_ROOT and end in .zip, .7z, or .rar",
                     "rom_root": str(ROM_ROOT),
                 })
                 return
