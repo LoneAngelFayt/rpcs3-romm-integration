@@ -123,22 +123,23 @@ Save states are stored as `<TITLEID>.savestate` files in `SAVE_DIR` (default `/c
 ```
 init-rpcs3-config (S6 oneshot)
   └── Clean stale display sockets (wayland-*, .X11-unix)
-  └── Install missing packages (python3, xdotool, p7zip-full, unzip)
+  └── Install missing packages (python3, wtype, p7zip-full, unzip)
   └── Disable labwc autostart — broker owns rpcs3 lifecycle
   └── Seed rpcs3 config.yml if it exists (fullscreen, no confirm-shutdown)
+  └── Suppress welcome/quickstart dialog (GuiConfigs/CurrentSettings.ini)
   └── Create and chown cache directory
 
 svc-broker (S6 longrun) → broker.py
-  └── Startup: kill stale rpcs3, launch to library view
+  └── Startup: kill stale rpcs3 (AppRun.wrapped), launch to library view
   └── POST /launch  → background thread
       ├── Kill current rpcs3 + drain gamepad sockets
       ├── Cache hit → touch .last_accessed → launch
       ├── LRU eviction (if CACHE_MAX_GB set)
-      ├── Extract .zip (zipfile stdlib) or .7z (7z -bsp1) → progress 0–100
+      ├── Extract .zip (zipfile stdlib) or .7z/.rar (7z -bsp1) → progress 0–100
       ├── Discover EBOOT.BIN (any depth)
-      └── Launch: sudo -u abc rpcs3 --no-gui /path/EBOOT.BIN
-  └── POST /save-state  → xdotool ctrl+s → poll savestates/ for write
-  └── POST /load-state  → xdotool ctrl+r (fire-and-forget)
+      └── Launch: sudo -u abc /opt/rpcs3/AppRun --no-gui /path/EBOOT.BIN
+  └── POST /save-state  → wtype ctrl+s → poll savestates/ for write
+  └── POST /load-state  → wtype ctrl+r (fire-and-forget)
   └── DELETE /launch    → _return_to_library()
   └── DELETE /cache/X   → shutil.rmtree (saves unaffected)
   └── POST /volume      → pactl set-sink-volume
@@ -156,8 +157,8 @@ The archive must contain a `EBOOT.BIN` somewhere inside the extracted tree. Veri
 **Save state not confirmed**
 If `SAVE_WAIT` expires without detecting a file write, the keypress was still delivered — rpcs3 may have saved successfully. Increase `SAVE_WAIT` if saves are large. Check `/config/savestates/` for the `.savestate` file.
 
-**xdotool: rpcs3 window not found**
-The rpcs3 process exists but its window is not visible. This can happen briefly during startup. `/load-state` and `/save-state` will return an error — retry after a few seconds.
+**Save/load state not working**
+The broker uses `wtype` to inject Ctrl+S/Ctrl+R into the Wayland session (labwc compositor). If rpcs3 is not the focused window, the keypress may not reach it. In normal streaming use rpcs3 is always the only window and will have focus. Check container logs for `wtype` errors.
 
 **Controllers not working**
 The selkies joystick interposer requires an active streaming session before rpcs3 starts. Connect to the stream via the RomM player before launching a game.

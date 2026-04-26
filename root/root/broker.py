@@ -40,17 +40,21 @@ ENV = {
     "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
 }
 
-_XDOTOOL_ENV = {
-    "DISPLAY":         ENV["DISPLAY"],
+# Wayland key injection (wtype) — used for save/load state hotkeys.
+# rpcs3 runs under the labwc Wayland compositor; xdotool (X11) cannot
+# address Wayland-native windows.  wtype sends to the focused window,
+# which in a single-app streaming session is always rpcs3.
+_WTYPE_ENV = {
+    "WAYLAND_DISPLAY": ENV["WAYLAND_DISPLAY"],
+    "XDG_RUNTIME_DIR": "/config/.XDG",
     "HOME":            "/config",
     "USER":            "abc",
-    "XDG_RUNTIME_DIR": "/config/.XDG",
 }
 
-_XDOTOOL_CMD = (
+_WTYPE_CMD = (
     ["sudo", "-u", "abc", "env"]
-    + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
-    + ["xdotool"]
+    + [f"{k}={v}" for k, v in _WTYPE_ENV.items()]
+    + ["wtype"]
 )
 
 _PACTL_CMD = [
@@ -148,10 +152,11 @@ def _launch_rpcs3_internal(eboot_path: str | None) -> None:
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
-        "/opt/rpcs3/AppRun", "--no-gui",
+        "/opt/rpcs3/AppRun",
     ]
     if eboot_path:
-        cmd.append(eboot_path)
+        # --no-gui requires a boot target; library mode uses the full GUI
+        cmd += ["--no-gui", eboot_path]
 
     log.info("Launching rpcs3 (eboot=%s)", eboot_path or "library")
     try:
@@ -402,11 +407,13 @@ def _scan_cache() -> dict:
 # ── Launch flow ───────────────────────────────────────────────────────────────
 
 def _wait_for_rpcs3_window(timeout: float) -> bool:
-    """Poll until rpcs3 process is running or timeout. Returns True if found."""
+    """Poll until rpcs3 process (AppRun.wrapped) is running or timeout."""
+    # rpcs3 is installed as an AppDir; the actual process name is AppRun.wrapped
+    # (AppRun execs AppRun.wrapped, which is a symlink to usr/bin/rpcs3).
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            subprocess.check_output(["pgrep", "-x", "rpcs3"], text=True)
+            subprocess.check_output(["pgrep", "-x", "AppRun.wrapped"], text=True)
             return True
         except subprocess.CalledProcessError:
             pass
@@ -571,80 +578,52 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
     return False
 
 
-def _xdotool_find_window() -> str | None:
-    """Return X11 window ID for rpcs3, or None if not found."""
+def _rpcs3_is_running() -> bool:
+    """Return True if the rpcs3 AppDir process (AppRun.wrapped) is alive."""
     try:
-        pids = subprocess.check_output(["pgrep", "-x", "rpcs3"], text=True).split()
+        subprocess.check_output(["pgrep", "-x", "AppRun.wrapped"], text=True)
+        return True
     except subprocess.CalledProcessError:
-        log.error("xdotool: rpcs3 process not found")
-        return None
-
-    for pid in pids:
-        try:
-            out = subprocess.check_output(
-                _XDOTOOL_CMD + ["search", "--onlyvisible", "--pid", pid],
-                text=True, timeout=XDOTOOL_TIMEOUT,
-            )
-            ids = out.strip().split()
-            if ids:
-                log.debug("xdotool: found window %s for PID %s", ids[0], pid)
-                return ids[0]
-        except Exception as exc:
-            log.debug("xdotool: PID %s search failed: %s", pid, exc)
-
-    try:
-        out = subprocess.check_output(
-            _XDOTOOL_CMD + ["search", "--onlyvisible", "--classname", "rpcs3"],
-            text=True, timeout=XDOTOOL_TIMEOUT,
-        )
-        ids = out.strip().split()
-        if ids:
-            log.debug("xdotool: found window %s by classname", ids[0])
-            return ids[0]
-    except Exception as exc:
-        log.debug("xdotool: classname fallback failed: %s", exc)
-
-    log.error("xdotool: rpcs3 window not found")
-    return None
+        return False
 
 
-def _xdotool_save_state() -> bool:
-    """Send Ctrl+S to rpcs3 window and wait for .savestate write to complete."""
-    wid = _xdotool_find_window()
-    if wid is None:
+def _wtype_save_state() -> bool:
+    """Send Ctrl+S to the focused Wayland window (rpcs3) and wait for write."""
+    if not _rpcs3_is_running():
+        log.error("wtype: rpcs3 process not found")
         return False
 
     before = _sstate_snapshot()
     try:
         subprocess.run(
-            _XDOTOOL_CMD + ["key", "--window", wid, "ctrl+s"],
+            _WTYPE_CMD + ["-M", "ctrl", "-k", "s", "-m", "ctrl"],
             timeout=XDOTOOL_TIMEOUT, check=True,
         )
     except Exception as exc:
-        log.error("xdotool: ctrl+s failed: %s", exc)
+        log.error("wtype: ctrl+s failed: %s", exc)
         return False
 
-    log.info("xdotool: ctrl+s sent to window %s — waiting (max %.1fs)", wid, SAVE_WAIT)
+    log.info("wtype: ctrl+s sent — waiting for .savestate write (max %.1fs)", SAVE_WAIT)
     if not _wait_for_sstate_write(before, time.monotonic() + SAVE_WAIT):
-        log.warning("xdotool: save state write not confirmed within %.1fs", SAVE_WAIT)
+        log.warning("wtype: save state write not confirmed within %.1fs", SAVE_WAIT)
     return True
 
 
-def _xdotool_load_state() -> bool:
-    """Send Ctrl+R to rpcs3 window to load the most recent save state."""
-    wid = _xdotool_find_window()
-    if wid is None:
+def _wtype_load_state() -> bool:
+    """Send Ctrl+R to the focused Wayland window (rpcs3) to load the save state."""
+    if not _rpcs3_is_running():
+        log.error("wtype: rpcs3 process not found")
         return False
 
     try:
         subprocess.run(
-            _XDOTOOL_CMD + ["key", "--window", wid, "ctrl+r"],
+            _WTYPE_CMD + ["-M", "ctrl", "-k", "r", "-m", "ctrl"],
             timeout=XDOTOOL_TIMEOUT, check=True,
         )
-        log.info("xdotool: ctrl+r sent to window %s", wid)
+        log.info("wtype: ctrl+r sent")
         return True
     except Exception as exc:
-        log.error("xdotool: ctrl+r failed: %s", exc)
+        log.error("wtype: ctrl+r failed: %s", exc)
         return False
 
 
@@ -787,7 +766,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
             def _bg_save():
                 try:
-                    _xdotool_save_state()
+                    _wtype_save_state()
                 finally:
                     with _lock:
                         _session["save_in_progress"] = False
@@ -803,7 +782,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
                     return
-            ok = _xdotool_load_state()
+            ok = _wtype_load_state()
             self._send_json(
                 200 if ok else 503,
                 {"status": "ok" if ok else "error", "loaded": ok},
@@ -822,7 +801,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["launch_status"]    = "saving"
 
             def _bg_exit():
-                ok = _xdotool_save_state()
+                ok = _wtype_save_state()
                 if not ok:
                     log.warning("save-and-exit: save failed — returning to library anyway")
                 with _lock:
@@ -911,7 +890,8 @@ def main():
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    result = subprocess.run(["pkill", "-9", "-x", "rpcs3"], capture_output=True)
+    # rpcs3 AppDir: the real process is AppRun.wrapped (AppRun execs into it).
+    result = subprocess.run(["pkill", "-9", "-x", "AppRun.wrapped"], capture_output=True)
     if result.returncode == 0:
         log.info("Killed stale rpcs3 instance(s) on startup.")
         time.sleep(2)

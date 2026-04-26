@@ -9,14 +9,14 @@ echo "[rpcs3-broker-mod] Cleaned up stale display sockets."
 
 # ── Package installation ───────────────────────────────────────────────────────
 _need_apt=0
-command -v python3    &>/dev/null || _need_apt=1
-command -v xdotool    &>/dev/null || _need_apt=1
-command -v 7z         &>/dev/null || _need_apt=1
-command -v unzip      &>/dev/null || _need_apt=1
+command -v python3 &>/dev/null || _need_apt=1
+command -v wtype   &>/dev/null || _need_apt=1
+command -v 7z      &>/dev/null || _need_apt=1
+command -v unzip   &>/dev/null || _need_apt=1
 
 if [ "$_need_apt" = "1" ]; then
     echo "[rpcs3-broker-mod] Installing missing packages..."
-    apt-get update -qq && apt-get install -y -qq python3 xdotool p7zip-full unzip \
+    apt-get update -qq && apt-get install -y -qq python3 wtype p7zip-full unzip \
         || { echo "[rpcs3-broker-mod] ERROR: apt-get install failed"; exit 1; }
 fi
 
@@ -70,6 +70,22 @@ PYEOF
 else
     echo "[rpcs3-broker-mod] rpcs3 config.yml not found — will patch on next boot after first run."
 fi
+
+# ── Suppress rpcs3 welcome/quickstart dialog ──────────────────────────────────
+RPCS3_GUI_CONFIG="/config/.config/rpcs3/GuiConfigs/CurrentSettings.ini"
+mkdir -p "$(dirname "$RPCS3_GUI_CONFIG")"
+if [ -f "$RPCS3_GUI_CONFIG" ]; then
+    if grep -q "infoBoxEnabledWelcome" "$RPCS3_GUI_CONFIG"; then
+        sed -i 's/infoBoxEnabledWelcome=.*/infoBoxEnabledWelcome=false/' "$RPCS3_GUI_CONFIG"
+    elif grep -q '^\[main_window\]' "$RPCS3_GUI_CONFIG"; then
+        sed -i '/^\[main_window\]/a infoBoxEnabledWelcome=false' "$RPCS3_GUI_CONFIG"
+    else
+        printf '\n[main_window]\ninfoBoxEnabledWelcome=false\n' >> "$RPCS3_GUI_CONFIG"
+    fi
+else
+    printf '[main_window]\ninfoBoxEnabledWelcome=false\n' > "$RPCS3_GUI_CONFIG"
+fi
+echo "[rpcs3-broker-mod] Disabled welcome/quickstart dialog."
 
 # ── Fix ownership ─────────────────────────────────────────────────────────────
 chown -R abc:abc /config/.config/rpcs3 2>/dev/null || true
