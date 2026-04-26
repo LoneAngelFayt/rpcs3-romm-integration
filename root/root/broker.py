@@ -465,3 +465,152 @@ def _do_launch(rom_path: str) -> None:
     time.sleep(1)
     _launch_rpcs3_internal(str(eboot))
     _finish_launch()
+
+
+# ── Save states ───────────────────────────────────────────────────────────────
+
+def _sstate_snapshot() -> dict:
+    """Return {Path: (size, mtime)} for every .savestate file in SAVE_DIR."""
+    if not SAVE_DIR.is_dir():
+        return {}
+    snap = {}
+    for p in SAVE_DIR.glob("*.savestate"):
+        try:
+            st = p.stat()
+            snap[p] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+    return snap
+
+
+def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
+    """Poll SAVE_DIR until a .savestate write completes or deadline is reached."""
+    STABLE_SECS  = 0.5
+    POLL_SECS    = 0.1
+    start        = time.monotonic()
+    target       = None
+    last_size    = None
+    stable_since = None
+
+    while time.monotonic() < deadline:
+        after = _sstate_snapshot()
+
+        if target is None:
+            for p, (size, mtime) in after.items():
+                prev = before.get(p)
+                if prev is None or prev[1] != mtime:
+                    target       = p
+                    last_size    = size
+                    stable_since = time.monotonic()
+                    log.debug("Save: write detected — %s (%d bytes)", p.name, size)
+                    break
+        else:
+            cur = after.get(target)
+            if cur is None:
+                target = None
+            else:
+                cur_size = cur[0]
+                if cur_size != last_size:
+                    last_size    = cur_size
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= STABLE_SECS:
+                    log.info(
+                        "Save state write complete — %s (%d bytes) in %.1fs",
+                        target.name, last_size, time.monotonic() - start,
+                    )
+                    return True
+
+        time.sleep(POLL_SECS)
+    return False
+
+
+def _xdotool_find_window() -> str | None:
+    """Return X11 window ID for rpcs3, or None if not found."""
+    xdo_base = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+    try:
+        pids = subprocess.check_output(["pgrep", "-x", "rpcs3"], text=True).split()
+    except subprocess.CalledProcessError:
+        log.error("xdotool: rpcs3 process not found")
+        return None
+
+    for pid in pids:
+        try:
+            out = subprocess.check_output(
+                xdo_base + ["search", "--onlyvisible", "--pid", pid],
+                text=True, timeout=XDOTOOL_TIMEOUT,
+            )
+            ids = out.strip().split()
+            if ids:
+                log.debug("xdotool: found window %s for PID %s", ids[-1], pid)
+                return ids[-1]
+        except Exception as exc:
+            log.debug("xdotool: PID %s search failed: %s", pid, exc)
+
+    try:
+        out = subprocess.check_output(
+            xdo_base + ["search", "--onlyvisible", "--classname", "rpcs3"],
+            text=True, timeout=XDOTOOL_TIMEOUT,
+        )
+        ids = out.strip().split()
+        if ids:
+            log.debug("xdotool: found window %s by classname", ids[-1])
+            return ids[-1]
+    except Exception as exc:
+        log.debug("xdotool: classname fallback failed: %s", exc)
+
+    log.error("xdotool: rpcs3 window not found")
+    return None
+
+
+def _xdotool_save_state() -> bool:
+    """Send Ctrl+S to rpcs3 window and wait for .savestate write to complete."""
+    wid = _xdotool_find_window()
+    if wid is None:
+        return False
+
+    before = _sstate_snapshot()
+    xdo_cmd = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+    try:
+        subprocess.run(
+            xdo_cmd + ["key", "--window", wid, "ctrl+s"],
+            timeout=XDOTOOL_TIMEOUT, check=True,
+        )
+    except Exception as exc:
+        log.error("xdotool: ctrl+s failed: %s", exc)
+        return False
+
+    log.info("xdotool: ctrl+s sent to window %s — waiting (max %.1fs)", wid, SAVE_WAIT)
+    if not _wait_for_sstate_write(before, time.monotonic() + SAVE_WAIT):
+        log.warning("xdotool: save state write not confirmed within %.1fs", SAVE_WAIT)
+    return True
+
+
+def _xdotool_load_state() -> bool:
+    """Send Ctrl+R to rpcs3 window to load the most recent save state."""
+    wid = _xdotool_find_window()
+    if wid is None:
+        return False
+
+    xdo_cmd = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+    try:
+        subprocess.run(
+            xdo_cmd + ["key", "--window", wid, "ctrl+r"],
+            timeout=XDOTOOL_TIMEOUT, check=True,
+        )
+        log.info("xdotool: ctrl+r sent to window %s", wid)
+        return True
+    except Exception as exc:
+        log.error("xdotool: ctrl+r failed: %s", exc)
+        return False
