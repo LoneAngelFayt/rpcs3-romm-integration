@@ -17,11 +17,12 @@ command -v unzip      &>/dev/null || _need_apt=1
 if [ "$_need_apt" = "1" ]; then
     echo "[rpcs3-broker-mod] Installing missing packages..."
     apt-get update -qq && apt-get install -y -qq python3 xdotool p7zip-full unzip \
-        || echo "[rpcs3-broker-mod] ERROR: apt-get install failed"
+        || { echo "[rpcs3-broker-mod] ERROR: apt-get install failed"; exit 1; }
 fi
 
 # ── sudoers permissions ───────────────────────────────────────────────────────
-chmod 0440 /etc/sudoers.d/broker
+chmod 0440 /etc/sudoers.d/broker \
+    || { echo "[rpcs3-broker-mod] ERROR: sudoers file missing or chmod failed"; exit 1; }
 echo "[rpcs3-broker-mod] sudoers rule set."
 
 # ── Disable labwc autostart (broker owns rpcs3 lifecycle) ────────────────────
@@ -50,7 +51,7 @@ def _set_key(txt, key, value):
     """Replace 'key: anything' or append 'key: value' if absent."""
     pattern = rf'^(\s*{re.escape(key)}:\s*).*$'
     if re.search(pattern, txt, re.MULTILINE):
-        return re.sub(pattern, rf'\g<1>{value}', txt, flags=re.MULTILINE), False
+        return re.sub(pattern, lambda m: m.group(1) + value, txt, flags=re.MULTILINE), False
     txt += f'\n{key}: {value}'
     return txt, True
 
