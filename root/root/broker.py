@@ -47,6 +47,12 @@ _XDOTOOL_ENV = {
     "XDG_RUNTIME_DIR": "/config/.XDG",
 }
 
+_XDOTOOL_CMD = (
+    ["sudo", "-u", "abc", "env"]
+    + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+    + ["xdotool"]
+)
+
 _PACTL_CMD = [
     "sudo", "-u", "abc", "env",
     "PULSE_RUNTIME_PATH=/defaults",
@@ -526,11 +532,6 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
 
 def _xdotool_find_window() -> str | None:
     """Return X11 window ID for rpcs3, or None if not found."""
-    xdo_base = (
-        ["sudo", "-u", "abc", "env"]
-        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
-        + ["xdotool"]
-    )
     try:
         pids = subprocess.check_output(["pgrep", "-x", "rpcs3"], text=True).split()
     except subprocess.CalledProcessError:
@@ -540,25 +541,25 @@ def _xdotool_find_window() -> str | None:
     for pid in pids:
         try:
             out = subprocess.check_output(
-                xdo_base + ["search", "--onlyvisible", "--pid", pid],
+                _XDOTOOL_CMD + ["search", "--onlyvisible", "--pid", pid],
                 text=True, timeout=XDOTOOL_TIMEOUT,
             )
             ids = out.strip().split()
             if ids:
-                log.debug("xdotool: found window %s for PID %s", ids[-1], pid)
-                return ids[-1]
+                log.debug("xdotool: found window %s for PID %s", ids[0], pid)
+                return ids[0]
         except Exception as exc:
             log.debug("xdotool: PID %s search failed: %s", pid, exc)
 
     try:
         out = subprocess.check_output(
-            xdo_base + ["search", "--onlyvisible", "--classname", "rpcs3"],
+            _XDOTOOL_CMD + ["search", "--onlyvisible", "--classname", "rpcs3"],
             text=True, timeout=XDOTOOL_TIMEOUT,
         )
         ids = out.strip().split()
         if ids:
-            log.debug("xdotool: found window %s by classname", ids[-1])
-            return ids[-1]
+            log.debug("xdotool: found window %s by classname", ids[0])
+            return ids[0]
     except Exception as exc:
         log.debug("xdotool: classname fallback failed: %s", exc)
 
@@ -573,14 +574,9 @@ def _xdotool_save_state() -> bool:
         return False
 
     before = _sstate_snapshot()
-    xdo_cmd = (
-        ["sudo", "-u", "abc", "env"]
-        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
-        + ["xdotool"]
-    )
     try:
         subprocess.run(
-            xdo_cmd + ["key", "--window", wid, "ctrl+s"],
+            _XDOTOOL_CMD + ["key", "--window", wid, "ctrl+s"],
             timeout=XDOTOOL_TIMEOUT, check=True,
         )
     except Exception as exc:
@@ -599,14 +595,9 @@ def _xdotool_load_state() -> bool:
     if wid is None:
         return False
 
-    xdo_cmd = (
-        ["sudo", "-u", "abc", "env"]
-        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
-        + ["xdotool"]
-    )
     try:
         subprocess.run(
-            xdo_cmd + ["key", "--window", wid, "ctrl+r"],
+            _XDOTOOL_CMD + ["key", "--window", wid, "ctrl+r"],
             timeout=XDOTOOL_TIMEOUT, check=True,
         )
         log.info("xdotool: ctrl+r sent to window %s", wid)
