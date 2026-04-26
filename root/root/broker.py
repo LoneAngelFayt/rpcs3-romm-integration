@@ -605,3 +605,279 @@ def _xdotool_load_state() -> bool:
     except Exception as exc:
         log.error("xdotool: ctrl+r failed: %s", exc)
         return False
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+
+class BrokerHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        log.debug("HTTP %s", fmt % args)
+
+    def _check_secret(self) -> bool:
+        if not SECRET:
+            return True
+        return hmac.compare_digest(self.headers.get("X-Broker-Secret", ""), SECRET)
+
+    def _send_json(self, code: int, body: dict) -> None:
+        payload = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _read_body(self) -> dict:
+        try:
+            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+        except ValueError:
+            length = 0
+        if length == 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length))
+        except json.JSONDecodeError:
+            return {}
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json(200, {"status": "ok"})
+            return
+
+        if self.path == "/status":
+            with _lock:
+                active = (
+                    _session["process"] is not None
+                    and _session["process"].poll() is None
+                )
+                snap = dict(_session)
+            cache = _scan_cache()
+            total_bytes = sum(g["size_bytes"] for g in cache.values())
+            self._send_json(200, {
+                "active":          active,
+                "rom_path":        snap["rom_path"],
+                "rom_name":        snap["rom_name"],
+                "eboot_path":      snap["eboot_path"],
+                "started_at":      snap["started_at"],
+                "launch_status":   snap["launch_status"],
+                "launch_detail":   snap["launch_detail"],
+                "launch_progress": snap["launch_progress"],
+                "cache": {
+                    "used_gb":    round(total_bytes / 1024 ** 3, 2),
+                    "max_gb":     CACHE_MAX_GB,
+                    "game_count": len(cache),
+                },
+            })
+            return
+
+        if self.path == "/cache":
+            cache = _scan_cache()
+            with _lock:
+                active_stem = Path(_session["rom_path"]).stem if _session["rom_path"] else None
+            total_bytes = sum(g["size_bytes"] for g in cache.values())
+            games = [
+                {
+                    "name":          name,
+                    "size_gb":       round(g["size_bytes"] / 1024 ** 3, 2),
+                    "last_accessed": g["last_accessed"],
+                    "active":        name == active_stem,
+                }
+                for name, g in sorted(cache.items())
+            ]
+            self._send_json(200, {
+                "games":         games,
+                "total_size_gb": round(total_bytes / 1024 ** 3, 2),
+                "max_gb":        CACHE_MAX_GB,
+            })
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
+            return
+
+        if self.path == "/launch":
+            with _lock:
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save in progress"})
+                    return
+
+            body = self._read_body()
+            raw_path = body.get("rom_path", "").strip()
+            if not raw_path:
+                self._send_json(400, {"error": "rom_path is required"})
+                return
+
+            rom_path = _validate_rom_path(raw_path)
+            if rom_path is None:
+                self._send_json(400, {
+                    "error": "rom_path must be within ROM_ROOT and end in .zip or .7z",
+                    "rom_root": str(ROM_ROOT),
+                })
+                return
+            if not rom_path.exists():
+                self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
+                return
+
+            Thread(target=_do_launch, args=(str(rom_path),), daemon=True).start()
+            self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
+            return
+
+        if self.path == "/save-state":
+            with _lock:
+                if _session["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save already in progress"})
+                    return
+                _session["save_in_progress"] = True
+                _session["launch_status"]    = "saving"
+
+            def _bg_save():
+                try:
+                    _xdotool_save_state()
+                finally:
+                    with _lock:
+                        _session["save_in_progress"] = False
+                        if _session["launch_status"] == "saving":
+                            _session["launch_status"] = "running"
+
+            Thread(target=_bg_save, daemon=True).start()
+            self._send_json(200, {"status": "saving"})
+            return
+
+        if self.path == "/load-state":
+            with _lock:
+                if _session["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+            ok = _xdotool_load_state()
+            self._send_json(
+                200 if ok else 503,
+                {"status": "ok" if ok else "error", "loaded": ok},
+            )
+            return
+
+        if self.path == "/save-and-exit":
+            with _lock:
+                if _session["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save already in progress"})
+                    return
+                _session["save_in_progress"] = True
+                _session["launch_status"]    = "saving"
+
+            def _bg_exit():
+                ok = _xdotool_save_state()
+                if not ok:
+                    log.warning("save-and-exit: save failed — returning to library anyway")
+                with _lock:
+                    _session["save_in_progress"] = False
+                _return_to_library()
+
+            Thread(target=_bg_exit, daemon=True).start()
+            self._send_json(200, {"status": "queued"})
+            return
+
+        if self.path == "/volume":
+            body = self._read_body()
+            level = body.get("level")
+            if not isinstance(level, int) or not (0 <= level <= 100):
+                self._send_json(400, {"error": "level must be an integer 0–100"})
+                return
+            result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
+            if result.returncode != 0:
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
+                return
+            self._send_json(200, {"status": "ok", "level": level})
+            return
+
+        if self.path == "/mute":
+            body = self._read_body()
+            mute_arg = "1" if body.get("mute") else ("0" if "mute" in body else "toggle")
+            result = _pactl("set-sink-mute", "@DEFAULT_SINK@", mute_arg)
+            if result.returncode != 0:
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
+                return
+            self._send_json(200, {"status": "ok", "mute": _pactl_get_mute()})
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
+            return
+
+        if self.path == "/launch":
+            Thread(target=_return_to_library, daemon=True).start()
+            self._send_json(200, {"status": "ok"})
+            return
+
+        if self.path.startswith("/cache/"):
+            game_name = self.path[len("/cache/"):]
+            if not game_name:
+                self._send_json(400, {"error": "game name required"})
+                return
+            with _lock:
+                active_stem = Path(_session["rom_path"]).stem if _session["rom_path"] else None
+            if game_name == active_stem:
+                self._send_json(409, {"error": "cannot evict active game"})
+                return
+            game_dir = CACHE_DIR / game_name
+            if not game_dir.is_dir():
+                self._send_json(404, {"error": "game not in cache"})
+                return
+            freed = _dir_size_bytes(game_dir)
+            shutil.rmtree(game_dir)
+            log.info("Cache: manually evicted %s (%.2f GB)", game_name, freed / 1024 ** 3)
+            self._send_json(200, {"status": "ok", "freed_gb": round(freed / 1024 ** 3, 2)})
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    log.info("Broker starting — waiting 5s for desktop...")
+    time.sleep(5)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(["pkill", "-9", "-f", "rpcs3"], capture_output=True)
+    if result.returncode == 0:
+        log.info("Killed stale rpcs3 instance(s) on startup.")
+        time.sleep(2)
+
+    if not SECRET:
+        log.warning("BROKER_SECRET not set — all POST/DELETE endpoints are unauthenticated")
+
+    _launch_rpcs3_internal(None)
+
+    server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
+    log.info("rpcs3 broker listening on port %d", PORT)
+    if SECRET:
+        log.info("Shared secret auth enabled")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
