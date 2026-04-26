@@ -352,21 +352,45 @@ def _find_boot_target(root: Path) -> Path | None:
 
 
 def _extract_zip(archive_path: str, dest: Path) -> None:
-    """Extract ZIP archive; track launch_progress by uncompressed bytes (0–99).
+    """Extract ZIP archive; poll output-dir size for launch_progress (0–99).
 
-    Uses ZipInfo.file_size (uncompressed) so progress is proportional to data
-    written rather than file count — accurate even when one file dominates.
+    Per-file progress via ZipInfo.file_size looks right for multi-file archives
+    but blocks the whole loop on a single large file (e.g. a 14 GB .iso inside
+    the zip).  Instead we run extractall() in a thread and poll du -sb from the
+    main thread — identical to the 7z strategy and accurate for any layout.
     """
     log.info("Extracting %s (zip)", Path(archive_path).name)
+
+    # Read central directory upfront to get total uncompressed bytes.
     with _zipfile.ZipFile(archive_path) as zf:
-        members = zf.infolist()
-        total_bytes = max(1, sum(m.file_size for m in members))
-        done_bytes = 0
-        for member in members:
-            zf.extract(member, dest)
-            done_bytes += member.file_size
-            with _lock:
-                _session["launch_progress"] = min(99, int(done_bytes / total_bytes * 100))
+        total_bytes = max(1, sum(m.file_size for m in zf.infolist()))
+
+    exc_holder: list[BaseException | None] = [None]
+
+    def _do_extract() -> None:
+        try:
+            with _zipfile.ZipFile(archive_path) as zf2:
+                zf2.extractall(dest)
+        except Exception as exc:
+            exc_holder[0] = exc
+
+    t = Thread(target=_do_extract, daemon=True)
+    t.start()
+    while t.is_alive():
+        try:
+            r = subprocess.run(
+                ["du", "-sb", str(dest)],
+                capture_output=True, text=True, timeout=10,
+            )
+            extracted = int(r.stdout.split()[0]) if r.returncode == 0 else 0
+        except Exception:
+            extracted = 0
+        with _lock:
+            _session["launch_progress"] = min(99, int(extracted / total_bytes * 100))
+        t.join(timeout=3)  # sleep 3 s then re-check
+
+    if exc_holder[0]:
+        raise exc_holder[0]
     log.info("Extraction complete: %s", Path(archive_path).name)
 
 
