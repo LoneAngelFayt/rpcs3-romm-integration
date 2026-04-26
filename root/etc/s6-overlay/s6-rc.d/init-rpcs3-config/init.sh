@@ -12,6 +12,7 @@ _need_apt=0
 command -v python3    &>/dev/null || _need_apt=1
 command -v xdotool    &>/dev/null || _need_apt=1
 command -v 7z         &>/dev/null || _need_apt=1
+command -v unzip      &>/dev/null || _need_apt=1
 
 if [ "$_need_apt" = "1" ]; then
     echo "[rpcs3-broker-mod] Installing missing packages..."
