@@ -126,7 +126,10 @@ def _kill_rpcs3() -> None:
         except subprocess.TimeoutExpired:
             log.warning("rpcs3 did not exit after SIGTERM — sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.error("rpcs3 did not exit after SIGKILL — giving up")
     except ProcessLookupError:
         pass
 
@@ -179,8 +182,8 @@ def _monitor_process(proc, start_time: float) -> None:
     time.sleep(wait_time)
 
     with _lock:
-        if not _session["is_managed"]:
-            return
+        if not _session["is_managed"] or _session["process"] is not proc:
+            return  # a new launch took over during the sleep — do nothing
 
     _return_to_library()
 
