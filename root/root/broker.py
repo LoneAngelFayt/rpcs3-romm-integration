@@ -336,19 +336,71 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
 
 
 def _find_boot_target(root: Path) -> Path | None:
-    """Walk extracted tree and return the best boot target for rpcs3.
-
-    Priority:
-      1. EBOOT.BIN  — decrypted PS3 game directory (most common retail format)
-      2. *.iso      — PS3 disc image (rpcs3 --no-gui accepts ISO directly)
-
-    Returns None if neither is found.
-    """
+    """Return the first EBOOT.BIN found in the extracted game tree, or None."""
     for path in root.rglob("EBOOT.BIN"):
         return path
-    for path in root.rglob("*.iso"):
-        return path
     return None
+
+
+def _expand_iso_if_needed(game_dir: Path) -> None:
+    """Expand any .iso disc images found in game_dir, then delete them.
+
+    rpcs3 cannot reliably boot ISO disc images via --no-gui; we use 7z
+    (which understands ISO 9660/UDF) to extract the disc contents in-place
+    so the broker can boot EBOOT.BIN instead.  Progress is tracked via
+    du -sb so the UI stays live during what can be a multi-minute step.
+    """
+    isos = list(game_dir.rglob("*.iso"))
+    if not isos:
+        return
+
+    for iso in isos:
+        try:
+            iso_bytes = max(1, iso.stat().st_size)
+        except OSError:
+            iso_bytes = 1
+
+        log.info("Expanding disc image: %s (%.2f GB)", iso.name, iso_bytes / 1024 ** 3)
+        with _lock:
+            _session["launch_detail"]   = "Expanding disc image…"
+            _session["launch_progress"] = 0
+
+        proc = subprocess.Popen(
+            ["7z", "x", "-y", str(iso), f"-o{game_dir}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Poll directory growth vs ISO size for progress.
+        # The ISO file itself stays in game_dir while 7z extracts from it,
+        # so we subtract iso_bytes from the total to get the extracted delta.
+        while proc.poll() is None:
+            try:
+                r = subprocess.run(
+                    ["du", "-sb", str(game_dir)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                dir_bytes = int(r.stdout.split()[0]) if r.returncode == 0 else 0
+                new_bytes = max(0, dir_bytes - iso_bytes)
+                pct = min(99, int(new_bytes / iso_bytes * 100))
+            except Exception:
+                pct = 0
+            with _lock:
+                _session["launch_progress"] = pct
+            time.sleep(3)
+
+        if proc.returncode != 0:
+            log.error(
+                "7z failed to expand disc image %s (rc=%d)",
+                iso.name, proc.returncode,
+            )
+            continue
+
+        try:
+            iso.unlink()
+            log.info("Disc image expanded and removed: %s", iso.name)
+        except OSError as exc:
+            log.warning("Could not remove ISO %s: %s", iso.name, exc)
 
 
 def _extract_zip(archive_path: str, dest: Path) -> None:
@@ -541,13 +593,17 @@ def _do_launch(rom_path: str) -> None:
             _session["launch_progress"] = None
         return
 
+    # If the archive contained a disc image (.iso), expand it with 7z so we
+    # can boot EBOOT.BIN directly.  rpcs3 --no-gui cannot boot ISOs reliably.
+    _expand_iso_if_needed(game_dir)
+
     boot_target = _find_boot_target(game_dir)
     if boot_target is None:
-        log.error("No boot target (EBOOT.BIN or .iso) found in %s", game_dir)
+        log.error("No EBOOT.BIN found in %s", game_dir)
         shutil.rmtree(game_dir, ignore_errors=True)
         with _lock:
             _session["launch_status"]   = "error"
-            _session["launch_detail"]   = "No EBOOT.BIN or .iso found in archive"
+            _session["launch_detail"]   = "No EBOOT.BIN found (check archive structure)"
             _session["launch_progress"] = None
         return
     eboot = boot_target
