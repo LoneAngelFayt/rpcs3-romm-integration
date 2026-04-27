@@ -157,7 +157,7 @@ def _launch_rpcs3_internal(eboot_path: str | None) -> None:
         # --no-gui requires a boot target; library mode uses the full GUI
         cmd += ["--no-gui", eboot_path]
 
-    log.info("Launching rpcs3 (eboot=%s)", eboot_path or "library")
+    log.info("Launching rpcs3 (boot=%s)", eboot_path or "library")
     try:
         proc = subprocess.Popen(
             cmd,
@@ -336,71 +336,22 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
 
 
 def _find_boot_target(root: Path) -> Path | None:
-    """Return the first EBOOT.BIN found in the extracted game tree, or None."""
-    for path in root.rglob("EBOOT.BIN"):
-        return path
-    return None
+    """Return the best boot target for rpcs3 in the extracted game tree.
 
+    Disc-based games (JB folder dumps) contain PS3_DISC.SFB at the disc root
+    alongside PS3_GAME/.  rpcs3 must receive the *directory* that contains
+    PS3_DISC.SFB so it sets up the virtual disc correctly.
 
-def _expand_iso_if_needed(game_dir: Path) -> None:
-    """Expand any .iso disc images found in game_dir, then delete them.
-
-    rpcs3 cannot reliably boot ISO disc images via --no-gui; we use 7z
-    (which understands ISO 9660/UDF) to extract the disc contents in-place
-    so the broker can boot EBOOT.BIN instead.  Progress is tracked via
-    du -sb so the UI stays live during what can be a multi-minute step.
+    PKG-installed or eboot-only games lack PS3_DISC.SFB; for those we fall
+    back to the EBOOT.BIN path.
     """
-    isos = list(game_dir.rglob("*.iso"))
-    if not isos:
-        return
-
-    for iso in isos:
-        try:
-            iso_bytes = max(1, iso.stat().st_size)
-        except OSError:
-            iso_bytes = 1
-
-        log.info("Expanding disc image: %s (%.2f GB)", iso.name, iso_bytes / 1024 ** 3)
-        with _lock:
-            _session["launch_detail"]   = "Expanding disc image…"
-            _session["launch_progress"] = 0
-
-        proc = subprocess.Popen(
-            ["7z", "x", "-y", str(iso), f"-o{game_dir}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        # Poll directory growth vs ISO size for progress.
-        # The ISO file itself stays in game_dir while 7z extracts from it,
-        # so we subtract iso_bytes from the total to get the extracted delta.
-        while proc.poll() is None:
-            try:
-                r = subprocess.run(
-                    ["du", "-sb", str(game_dir)],
-                    capture_output=True, text=True, timeout=10,
-                )
-                dir_bytes = int(r.stdout.split()[0]) if r.returncode == 0 else 0
-                new_bytes = max(0, dir_bytes - iso_bytes)
-                pct = min(99, int(new_bytes / iso_bytes * 100))
-            except Exception:
-                pct = 0
-            with _lock:
-                _session["launch_progress"] = pct
-            time.sleep(3)
-
-        if proc.returncode != 0:
-            log.error(
-                "7z failed to expand disc image %s (rc=%d)",
-                iso.name, proc.returncode,
-            )
-            continue
-
-        try:
-            iso.unlink()
-            log.info("Disc image expanded and removed: %s", iso.name)
-        except OSError as exc:
-            log.warning("Could not remove ISO %s: %s", iso.name, exc)
+    # Prefer disc root: the directory that contains PS3_DISC.SFB
+    for sfb in root.rglob("PS3_DISC.SFB"):
+        return sfb.parent
+    # Fall back to EBOOT.BIN for installed / PKG-extracted games
+    for eboot in root.rglob("EBOOT.BIN"):
+        return eboot
+    return None
 
 
 def _extract_zip(archive_path: str, dest: Path) -> None:
@@ -592,10 +543,6 @@ def _do_launch(rom_path: str) -> None:
             _session["launch_detail"]   = f"Extraction failed: {exc}"
             _session["launch_progress"] = None
         return
-
-    # If the archive contained a disc image (.iso), expand it with 7z so we
-    # can boot EBOOT.BIN directly.  rpcs3 --no-gui cannot boot ISOs reliably.
-    _expand_iso_if_needed(game_dir)
 
     boot_target = _find_boot_target(game_dir)
     if boot_target is None:

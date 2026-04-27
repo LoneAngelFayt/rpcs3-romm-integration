@@ -14,7 +14,21 @@ Once firmware is installed, rpcs3 is ready to launch games via RomM. Controller 
 
 ## Game Archive Format
 
-Store PS3 games as `.zip`, `.7z`, or `.rar` archives in your RomM library. The archive must contain the game folder with `EBOOT.BIN` somewhere inside (the broker finds it automatically regardless of folder depth).
+Store PS3 games as `.zip`, `.7z`, or `.rar` archives of the **decrypted game folder** (JB folder / HDD dump format). The archive must contain the game folder with `EBOOT.BIN` somewhere inside — the broker finds it automatically regardless of folder depth.
+
+**Required format:** A decrypted game dump where `EBOOT.BIN` is a valid PS3 SELF file. This is produced by tools like MultiMAN or Rebug Toolbox using their "Copy to HDD" or "Backup Manager" functions on a jailbroken PS3. The resulting folder structure looks like:
+
+```
+Demon_Souls/
+  PS3_DISC.SFB
+  PS3_GAME/
+    PARAM.SFO
+    USRDIR/
+      EBOOT.BIN   ← must be a decrypted SELF (starts with SCE magic)
+      ...
+```
+
+**ISO files are not supported.** Raw disc images (`.iso`) contain NPDRM-encrypted executables that cannot be decrypted without PS3 hardware. Use the JB folder format instead.
 
 To create an archive from a game folder:
 ```bash
@@ -135,9 +149,9 @@ svc-broker (S6 longrun) → broker.py
       ├── Kill current rpcs3 + drain gamepad sockets
       ├── Cache hit → touch .last_accessed → launch
       ├── LRU eviction (if CACHE_MAX_GB set)
-      ├── Extract .zip (zipfile stdlib) or .7z/.rar (7z -bsp1) → progress 0–100
-      ├── Discover EBOOT.BIN (any depth)
-      └── Launch: sudo -u abc /opt/rpcs3/AppRun --no-gui /path/EBOOT.BIN
+      ├── Extract .zip (zipfile stdlib) or .7z/.rar (7z) → progress 0–100
+      ├── Discover PS3_DISC.SFB (disc root) or EBOOT.BIN (installed game)
+      └── Launch: sudo -u abc /opt/rpcs3/AppRun --no-gui /path/to/boot/target
   └── POST /save-state  → wtype ctrl+s → poll savestates/ for write
   └── POST /load-state  → wtype ctrl+r (fire-and-forget)
   └── DELETE /launch    → _return_to_library()
@@ -152,7 +166,7 @@ svc-broker (S6 longrun) → broker.py
 Poll `/status` — check `launch_status` and `launch_detail`. If stuck on `"extracting"`, the archive may be corrupt. If stuck on `"launching"`, rpcs3 may have crashed — check container logs.
 
 **No EBOOT.BIN found**
-The archive must contain a `EBOOT.BIN` somewhere inside the extracted tree. Verify the archive structure: `unzip -l game.zip | grep EBOOT`.
+The archive must be a JB folder dump containing `EBOOT.BIN` in the extracted tree. ISO files are not supported — see [Game Archive Format](#game-archive-format). Verify the archive structure: `unzip -l game.zip | grep -E "EBOOT|PS3_DISC"`.
 
 **Save state not confirmed**
 If `SAVE_WAIT` expires without detecting a file write, the keypress was still delivered — rpcs3 may have saved successfully. Increase `SAVE_WAIT` if saves are large. Check `/config/savestates/` for the `.savestate` file.
