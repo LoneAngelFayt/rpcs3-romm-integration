@@ -110,7 +110,9 @@ def _resolve_rom_path(p: Path) -> Path | None:
     on library structure and when the ROM was scanned.  If the exact path
     doesn't exist, try stripping or inserting one roms/ level under ROM_ROOT.
     """
+    log.debug("resolve_rom_path: checking %s", p)
     if p.exists():
+        log.debug("resolve_rom_path: exact path exists")
         return p
     rel = p.relative_to(ROM_ROOT)
     parts = rel.parts
@@ -120,8 +122,11 @@ def _resolve_rom_path(p: Path) -> Path | None:
     else:
         candidates.append(ROM_ROOT / "roms" / rel)
     for c in candidates:
+        log.debug("resolve_rom_path: trying candidate %s", c)
         if c.suffix.lower() in (".zip", ".7z", ".rar") and c.is_relative_to(ROM_ROOT) and c.exists():
+            log.debug("resolve_rom_path: candidate exists, using %s", c)
             return c
+    log.warning("resolve_rom_path: no file found for %s (tried %s)", p, candidates)
     return None
 
 
@@ -815,7 +820,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             resolved = _resolve_rom_path(rom_path)
             if resolved is None:
-                self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
+                self._send_json(422, {
+                    "error": "rom_path does not exist",
+                    "path": str(rom_path),
+                    "rom_root": str(ROM_ROOT),
+                    "also_tried": str(ROM_ROOT / "roms" / rom_path.relative_to(ROM_ROOT))
+                        if rom_path.relative_to(ROM_ROOT).parts[0] != "roms"
+                        else str(ROM_ROOT.joinpath(*rom_path.relative_to(ROM_ROOT).parts[1:])),
+                })
                 return
 
             Thread(target=_do_launch, args=(str(resolved),), daemon=True).start()
