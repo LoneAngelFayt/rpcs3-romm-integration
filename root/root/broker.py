@@ -103,6 +103,28 @@ def _validate_rom_path(raw: str) -> Path | None:
     return p
 
 
+def _resolve_rom_path(p: Path) -> Path | None:
+    """Return an existing path, trying roms/ prefix alternatives.
+
+    RomM's full_path may or may not include a leading roms/ component depending
+    on library structure and when the ROM was scanned.  If the exact path
+    doesn't exist, try stripping or inserting one roms/ level under ROM_ROOT.
+    """
+    if p.exists():
+        return p
+    rel = p.relative_to(ROM_ROOT)
+    parts = rel.parts
+    candidates = []
+    if parts and parts[0] == "roms":
+        candidates.append(ROM_ROOT.joinpath(*parts[1:]))
+    else:
+        candidates.append(ROM_ROOT / "roms" / rel)
+    for c in candidates:
+        if c.suffix.lower() in (".zip", ".7z", ".rar") and c.is_relative_to(ROM_ROOT) and c.exists():
+            return c
+    return None
+
+
 def _pactl(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         _PACTL_CMD + ["pactl"] + list(args),
@@ -791,12 +813,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     "rom_root": str(ROM_ROOT),
                 })
                 return
-            if not rom_path.exists():
+            resolved = _resolve_rom_path(rom_path)
+            if resolved is None:
                 self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
                 return
 
-            Thread(target=_do_launch, args=(str(rom_path),), daemon=True).start()
-            self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
+            Thread(target=_do_launch, args=(str(resolved),), daemon=True).start()
+            self._send_json(200, {"status": "launching", "rom_path": str(resolved)})
             return
 
         if self.path == "/save-state":
