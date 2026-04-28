@@ -14,9 +14,21 @@ Once firmware is installed, rpcs3 is ready to launch games via RomM. Controller 
 
 ## Game Archive Format
 
-Store PS3 games as `.zip`, `.7z`, or `.rar` archives of the **decrypted game folder** (JB folder / HDD dump format). The archive must contain the game folder with `EBOOT.BIN` somewhere inside — the broker finds it automatically regardless of folder depth.
+Three formats are supported. **All require decrypted content** — files produced directly from disc rips (NPDRM-encrypted) will fail inside rpcs3 with "invalid file or folder."
 
-**Required format:** A decrypted game dump where `EBOOT.BIN` is a valid PS3 SELF file. This is produced by tools like MultiMAN or Rebug Toolbox using their "Copy to HDD" or "Backup Manager" functions on a jailbroken PS3. The resulting folder structure looks like:
+### Format 1: Decrypted ISO (`.iso`)
+
+Store the decrypted disc image directly. rpcs3 mounts it as a virtual disc:
+
+```
+Demon_Souls.iso   ← decrypted ISO; EBOOT.BIN inside starts with SCE magic
+```
+
+Decrypted ISOs can be produced by tools such as ps3iso-tools. **Standard disc rips are encrypted and will not work** — the ISO must be fully decrypted before storing.
+
+### Format 2: Archived JB folder (`.zip`, `.7z`, `.rar`)
+
+Store the decrypted game folder (JB folder / HDD dump) inside an archive. Produced by tools like MultiMAN or Rebug Toolbox using "Copy to HDD" on a jailbroken PS3, or by extracting a decrypted ISO with ps3iso-tools. The resulting folder structure:
 
 ```
 Demon_Souls/
@@ -24,11 +36,11 @@ Demon_Souls/
   PS3_GAME/
     PARAM.SFO
     USRDIR/
-      EBOOT.BIN   ← must be a decrypted SELF (starts with SCE magic)
+      EBOOT.BIN   ← decrypted SELF (starts with SCE magic)
       ...
 ```
 
-**ISO files are not supported.** Raw disc images (`.iso`) contain NPDRM-encrypted executables that cannot be decrypted without PS3 hardware. Use the JB folder format instead.
+An archive may also contain a decrypted `.iso` directly — the broker will find and boot it.
 
 To create an archive from a game folder:
 ```bash
@@ -42,7 +54,7 @@ zip -r "Demon_Souls.zip" "Demon_Souls/"
 # Extraction is handled automatically — no conversion needed
 ```
 
-All three formats report extraction progress (0–100%) to the RomM frontend. 7z is recommended for new archives — it typically saves 5–15 GB per game. RAR archives are extracted via p7zip and behave identically to .7z at runtime.
+ZIP/7z/RAR formats report extraction progress (0–100%) to the RomM frontend. 7z is recommended — it typically saves 5–15 GB per game. Direct `.iso` files skip extraction entirely and boot immediately.
 
 ## Usage
 
@@ -94,7 +106,7 @@ All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is 
 | `/health` | GET | — | `{"status": "ok"}` |
 | `/status` | GET | — | Session state, cache info, and launch progress |
 | `/cache` | GET | — | List cached games with sizes and last-accessed times |
-| `/launch` | POST | `{"rom_path": "..."}` | Extract archive (.zip/.7z/.rar) if needed and launch game |
+| `/launch` | POST | `{"rom_path": "..."}` | Boot decrypted `.iso` directly, or extract archive (.zip/.7z/.rar) and launch |
 | `/launch` | DELETE | — | Kill game, return to rpcs3 library view |
 | `/save-state` | POST | — | Send Ctrl+S to rpcs3 |
 | `/load-state` | POST | — | Send Ctrl+R to rpcs3 |
@@ -147,10 +159,11 @@ svc-broker (S6 longrun) → broker.py
   └── Startup: kill stale rpcs3 (AppRun.wrapped), launch to library view
   └── POST /launch  → background thread
       ├── Kill current rpcs3 + drain gamepad sockets
+      ├── Direct .iso → boot in-place (no extraction)
       ├── Cache hit → touch .last_accessed → launch
       ├── LRU eviction (if CACHE_MAX_GB set)
       ├── Extract .zip (zipfile stdlib) or .7z/.rar (7z) → progress 0–100
-      ├── Discover PS3_DISC.SFB (disc root) or EBOOT.BIN (installed game)
+      ├── Discover PS3_DISC.SFB (disc root), .iso, or EBOOT.BIN
       └── Launch: sudo -u abc /opt/rpcs3/AppRun --no-gui /path/to/boot/target
   └── POST /save-state  → wtype ctrl+s → poll savestates/ for write
   └── POST /load-state  → wtype ctrl+r (fire-and-forget)
@@ -165,8 +178,8 @@ svc-broker (S6 longrun) → broker.py
 **Game doesn't launch after `/launch`**
 Poll `/status` — check `launch_status` and `launch_detail`. If stuck on `"extracting"`, the archive may be corrupt. If stuck on `"launching"`, rpcs3 may have crashed — check container logs.
 
-**No EBOOT.BIN found**
-The archive must be a JB folder dump containing `EBOOT.BIN` in the extracted tree. ISO files are not supported — see [Game Archive Format](#game-archive-format). Verify the archive structure: `unzip -l game.zip | grep -E "EBOOT|PS3_DISC"`.
+**No boot target found**
+The archive must contain a decrypted JB folder (with `PS3_DISC.SFB` or `EBOOT.BIN`) or a decrypted `.iso`. Encrypted disc rips will extract but rpcs3 will reject them. Verify the archive structure: `unzip -l game.zip | grep -E "EBOOT|PS3_DISC|\.iso"`.
 
 **Save state not confirmed**
 If `SAVE_WAIT` expires without detecting a file write, the keypress was still delivered — rpcs3 may have saved successfully. Increase `SAVE_WAIT` if saves are large. Check `/config/savestates/` for the `.savestate` file.

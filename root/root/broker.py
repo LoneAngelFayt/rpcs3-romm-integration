@@ -91,6 +91,9 @@ _session: dict = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+_VALID_EXTENSIONS = frozenset({".zip", ".7z", ".rar", ".iso"})
+
+
 def _validate_rom_path(raw: str) -> Path | None:
     try:
         p = Path(raw).resolve()
@@ -98,7 +101,7 @@ def _validate_rom_path(raw: str) -> Path | None:
         return None
     if not p.is_relative_to(ROM_ROOT):
         return None
-    if p.suffix.lower() not in (".zip", ".7z", ".rar"):
+    if p.suffix.lower() not in _VALID_EXTENSIONS:
         return None
     return p
 
@@ -123,7 +126,7 @@ def _resolve_rom_path(p: Path) -> Path | None:
         candidates.append(ROM_ROOT / "roms" / rel)
     for c in candidates:
         log.debug("resolve_rom_path: trying candidate %s", c)
-        if c.suffix.lower() in (".zip", ".7z", ".rar") and c.is_relative_to(ROM_ROOT) and c.exists():
+        if c.suffix.lower() in _VALID_EXTENSIONS and c.is_relative_to(ROM_ROOT) and c.exists():
             log.debug("resolve_rom_path: candidate exists, using %s", c)
             return c
     log.warning("resolve_rom_path: no file found for %s (tried %s)", p, candidates)
@@ -365,17 +368,15 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
 def _find_boot_target(root: Path) -> Path | None:
     """Return the best boot target for rpcs3 in the extracted game tree.
 
-    Disc-based games (JB folder dumps) contain PS3_DISC.SFB at the disc root
-    alongside PS3_GAME/.  rpcs3 must receive the *directory* that contains
-    PS3_DISC.SFB so it sets up the virtual disc correctly.
-
-    PKG-installed or eboot-only games lack PS3_DISC.SFB; for those we fall
-    back to the EBOOT.BIN path.
+    Priority:
+    1. Directory containing PS3_DISC.SFB — JB folder / disc dump (decrypted).
+    2. Decrypted ISO image (.iso) — rpcs3 mounts it as a virtual disc.
+    3. EBOOT.BIN — PKG-installed or eboot-only title.
     """
-    # Prefer disc root: the directory that contains PS3_DISC.SFB
     for sfb in root.rglob("PS3_DISC.SFB"):
         return sfb.parent
-    # Fall back to EBOOT.BIN for installed / PKG-extracted games
+    for iso in root.rglob("*.iso"):
+        return iso
     for eboot in root.rglob("EBOOT.BIN"):
         return eboot
     return None
@@ -518,6 +519,24 @@ def _do_launch(rom_path: str) -> None:
     _kill_rpcs3()
     _drain_gamepad_sockets()
 
+    # Direct ISO: boot in-place — no extraction or caching needed.
+    # The ISO must be decrypted (EBOOT.BIN inside starts with SCE magic);
+    # encrypted ISOs from disc rips will fail inside rpcs3 with "invalid file".
+    if archive.suffix.lower() == ".iso":
+        log.info("Direct ISO boot: %s", archive.name)
+        with _lock:
+            _session["rom_path"]        = rom_path
+            _session["rom_name"]        = stem
+            _session["eboot_path"]      = rom_path
+            _session["started_at"]      = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _session["launch_status"]   = "launching"
+            _session["launch_detail"]   = "Starting rpcs3…"
+            _session["launch_progress"] = None
+        time.sleep(1)
+        _launch_rpcs3_internal(rom_path)
+        _finish_launch()
+        return
+
     # Cache hit
     if game_dir.is_dir():
         eboot = _find_boot_target(game_dir)
@@ -573,11 +592,11 @@ def _do_launch(rom_path: str) -> None:
 
     boot_target = _find_boot_target(game_dir)
     if boot_target is None:
-        log.error("No EBOOT.BIN found in %s", game_dir)
+        log.error("No boot target found in %s", game_dir)
         shutil.rmtree(game_dir, ignore_errors=True)
         with _lock:
             _session["launch_status"]   = "error"
-            _session["launch_detail"]   = "No EBOOT.BIN found (check archive structure)"
+            _session["launch_detail"]   = "No boot target found — archive must contain a decrypted JB folder (PS3_DISC.SFB / EBOOT.BIN) or a decrypted ISO"
             _session["launch_progress"] = None
         return
     eboot = boot_target
@@ -814,7 +833,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             rom_path = _validate_rom_path(raw_path)
             if rom_path is None:
                 self._send_json(400, {
-                    "error": "rom_path must be within ROM_ROOT and end in .zip, .7z, or .rar",
+                    "error": "rom_path must be within ROM_ROOT and end in .zip, .7z, .rar, or .iso",
                     "rom_root": str(ROM_ROOT),
                 })
                 return
