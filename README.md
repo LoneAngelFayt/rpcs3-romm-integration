@@ -163,7 +163,7 @@ svc-broker (S6 longrun) → broker.py
       ├── Cache hit → touch .last_accessed → launch
       ├── LRU eviction (if CACHE_MAX_GB set)
       ├── Extract .zip (zipfile stdlib) or .7z/.rar (7z) → progress 0–100
-      ├── Discover PS3_DISC.SFB (disc root), .iso, or EBOOT.BIN
+      ├── Discover EBOOT.BIN or .iso boot target
       └── Launch: sudo -u abc /opt/rpcs3/AppRun --no-gui /path/to/boot/target
   └── POST /save-state  → wtype ctrl+s → poll savestates/ for write
   └── POST /load-state  → wtype ctrl+r (fire-and-forget)

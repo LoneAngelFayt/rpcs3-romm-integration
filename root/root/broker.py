@@ -366,19 +366,19 @@ def _evict_lru(needed_bytes: int, active_stem: str | None) -> None:
 
 
 def _find_boot_target(root: Path) -> Path | None:
-    """Return the best boot target for rpcs3 in the extracted game tree.
+    """Return the best boot target for rpcs3 --no-gui in the extracted game tree.
 
     Priority:
-    1. Directory containing PS3_DISC.SFB — JB folder / disc dump (decrypted).
-    2. Decrypted ISO image (.iso) — rpcs3 mounts it as a virtual disc.
-    3. EBOOT.BIN — PKG-installed or eboot-only title.
+    1. EBOOT.BIN — works reliably with --no-gui for both disc dumps and
+       digital/PKG-installed games.  rpcs3 resolves the disc context from the
+       parent directory structure, so passing the EBOOT.BIN path is sufficient.
+    2. Decrypted ISO image (.iso) — for archives that contain a bare ISO rather
+       than an extracted JB folder.
     """
-    for sfb in root.rglob("PS3_DISC.SFB"):
-        return sfb.parent
-    for iso in root.rglob("*.iso"):
-        return iso
     for eboot in root.rglob("EBOOT.BIN"):
         return eboot
+    for iso in root.rglob("*.iso"):
+        return iso
     return None
 
 
@@ -596,7 +596,7 @@ def _do_launch(rom_path: str) -> None:
         shutil.rmtree(game_dir, ignore_errors=True)
         with _lock:
             _session["launch_status"]   = "error"
-            _session["launch_detail"]   = "No boot target found — archive must contain a decrypted JB folder (PS3_DISC.SFB / EBOOT.BIN) or a decrypted ISO"
+            _session["launch_detail"]   = "No boot target found — archive must contain a decrypted EBOOT.BIN or a decrypted ISO"
             _session["launch_progress"] = None
         return
     eboot = boot_target
