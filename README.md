@@ -66,7 +66,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/New_York
-      - DOCKER_MODS=ghcr.io/YOUR_USERNAME/rpcs3-romm-integration-mod:latest
+      - DOCKER_MODS=ghcr.io/LoneAngelFayt/rpcs3-romm-integration-mod:latest
       - BROKER_PORT=8000
       - BROKER_SECRET=your-secret-here
       - ROM_ROOT=/romm/library
