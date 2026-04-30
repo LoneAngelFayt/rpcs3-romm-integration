@@ -161,12 +161,23 @@ def _kill_rpcs3() -> None:
     log.info("Stopping rpcs3 (PID %d)...", proc.pid)
     try:
         pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
+        broker_pgid = os.getpgrp()
+        if pgid == broker_pgid:
+            # Safety guard: don't killpg if rpcs3 somehow shares our process group.
+            log.warning(
+                "rpcs3 pgid %d == broker pgid — using SIGTERM to PID only", pgid
+            )
+            proc.send_signal(signal.SIGTERM)
+        else:
+            os.killpg(pgid, signal.SIGTERM)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             log.warning("rpcs3 did not exit after SIGTERM — sending SIGKILL")
-            os.killpg(pgid, signal.SIGKILL)
+            if pgid != broker_pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.send_signal(signal.SIGKILL)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -901,12 +912,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["launch_status"]    = "saving"
 
             def _bg_exit():
-                ok = _wtype_save_state()
-                if not ok:
-                    log.warning("save-and-exit: save failed — returning to library anyway")
-                with _lock:
-                    _session["save_in_progress"] = False
-                _return_to_library()
+                try:
+                    ok = _wtype_save_state()
+                    if not ok:
+                        log.warning("save-and-exit: save failed — returning to library anyway")
+                except Exception as exc:
+                    log.error("save-and-exit: unexpected error during save: %s", exc)
+                finally:
+                    with _lock:
+                        _session["save_in_progress"] = False
+                try:
+                    _return_to_library()
+                except Exception as exc:
+                    log.error("save-and-exit: unexpected error returning to library: %s", exc)
 
             Thread(target=_bg_exit, daemon=True).start()
             self._send_json(200, {"status": "queued"})
