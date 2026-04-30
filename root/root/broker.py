@@ -27,7 +27,7 @@ CACHE_MAX_GB       = float(os.environ.get("CACHE_MAX_GB", "0"))
 RPCS3_BOOT_TIMEOUT = float(os.environ.get("RPCS3_BOOT_TIMEOUT", "60.0"))
 XDOTOOL_TIMEOUT    = float(os.environ.get("XDOTOOL_TIMEOUT", "5.0"))
 SAVE_WAIT          = float(os.environ.get("SAVE_WAIT", "30.0"))
-SAVE_DIR           = Path(os.environ.get("SAVE_DIR", "/config/savestates"))
+SAVE_DIR           = Path(os.environ.get("SAVE_DIR", "/config/.config/rpcs3/savestates"))
 
 ENV = {
     "DISPLAY":            os.environ.get("DISPLAY", ":0"),
@@ -620,11 +620,11 @@ def _do_launch(rom_path: str) -> None:
 # ── Save states ───────────────────────────────────────────────────────────────
 
 def _sstate_snapshot() -> dict:
-    """Return {Path: (size, mtime)} for every .savestate file in SAVE_DIR."""
+    """Return {Path: (size, mtime)} for every .SAVESTAT.zst file in SAVE_DIR."""
     if not SAVE_DIR.is_dir():
         return {}
     snap = {}
-    for p in SAVE_DIR.glob("*.savestate"):
+    for p in SAVE_DIR.rglob("*.SAVESTAT.zst"):
         try:
             st = p.stat()
             snap[p] = (st.st_size, st.st_mtime)
@@ -699,24 +699,24 @@ def _wtype_save_state() -> bool:
         log.error("wtype: ctrl+s failed: %s", exc)
         return False
 
-    log.info("wtype: ctrl+s sent — waiting for .savestate write (max %.1fs)", SAVE_WAIT)
+    log.info("wtype: ctrl+s sent — waiting for .SAVESTAT.zst write (max %.1fs)", SAVE_WAIT)
     if not _wait_for_sstate_write(before, time.monotonic() + SAVE_WAIT):
         log.warning("wtype: save state write not confirmed within %.1fs", SAVE_WAIT)
     return True
 
 
 def _wtype_load_state() -> bool:
-    """Send Ctrl+R to the focused Wayland window (rpcs3) to load the save state."""
+    """Send Ctrl+L to the focused Wayland window (rpcs3) to load the save state."""
     if not _rpcs3_is_running():
         log.error("wtype: rpcs3 process not found")
         return False
 
     try:
         subprocess.run(
-            _WTYPE_CMD + ["-M", "ctrl", "-k", "r", "-m", "ctrl"],
+            _WTYPE_CMD + ["-M", "ctrl", "-k", "l", "-m", "ctrl"],
             timeout=XDOTOOL_TIMEOUT, check=True,
         )
-        log.info("wtype: ctrl+r sent")
+        log.info("wtype: ctrl+l sent")
         return True
     except Exception as exc:
         log.error("wtype: ctrl+r failed: %s", exc)
