@@ -112,6 +112,20 @@ else
 fi
 echo "[rpcs3-broker-mod] Disabled welcome/quickstart dialog."
 
+# ── Hide mouse cursor in game window ─────────────────────────────────────────
+_set_ini_key() {
+    local file="$1" key="$2" value="$3"
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s/^${key}=.*/${key}=${value}/" "$file"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+_set_ini_key "$RPCS3_GUI_CONFIG" "gs_disableMouse"    "true"
+_set_ini_key "$RPCS3_GUI_CONFIG" "gs_hideMouseOnIdle" "true"
+_set_ini_key "$RPCS3_GUI_CONFIG" "gs_hideMouseIdleTime" "1"
+echo "[rpcs3-broker-mod] Configured cursor hide in game window."
+
 # ── Fix ownership ─────────────────────────────────────────────────────────────
 chown -R abc:abc /config/.config/rpcs3 2>/dev/null || true
 echo "[rpcs3-broker-mod] Fixed rpcs3 config ownership."
