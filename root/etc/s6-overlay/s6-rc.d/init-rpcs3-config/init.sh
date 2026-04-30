@@ -20,6 +20,31 @@ if [ "$_need_apt" = "1" ]; then
         || { echo "[rpcs3-broker-mod] ERROR: apt-get install failed"; exit 1; }
 fi
 
+# ── rpcs3 binary upgrade ─────────────────────────────────────────────────────
+RPCS3_TARGET_BUILD="0.0.40-19261-e05d3597"
+RPCS3_APPIMAGE_URL="https://github.com/RPCS3/rpcs3-binaries-linux/releases/download/build-e05d35972192f7cb9a3af39dac83d6bd402c6861/rpcs3-v0.0.40-19261-e05d3597_linux64.AppImage"
+RPCS3_APPIMAGE_CACHE="/config/rpcs3-v0.0.40.AppImage"
+
+_current_build=$(/opt/rpcs3/usr/bin/rpcs3 --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+-\d+-[0-9a-f]+' || true)
+if [[ "$_current_build" != "$RPCS3_TARGET_BUILD"* ]]; then
+    echo "[rpcs3-broker-mod] rpcs3 is $_current_build, upgrading to $RPCS3_TARGET_BUILD..."
+    if [ ! -f "$RPCS3_APPIMAGE_CACHE" ]; then
+        echo "[rpcs3-broker-mod] Downloading rpcs3 AppImage..."
+        curl -sL -o "$RPCS3_APPIMAGE_CACHE" "$RPCS3_APPIMAGE_URL" \
+            || { echo "[rpcs3-broker-mod] ERROR: download failed"; rm -f "$RPCS3_APPIMAGE_CACHE"; }
+    fi
+    if [ -f "$RPCS3_APPIMAGE_CACHE" ]; then
+        chmod +x "$RPCS3_APPIMAGE_CACHE"
+        cd /tmp && "$RPCS3_APPIMAGE_CACHE" --appimage-extract > /dev/null 2>&1 \
+            && cp -rf /tmp/squashfs-root/. /opt/rpcs3/ \
+            && rm -rf /tmp/squashfs-root \
+            && echo "[rpcs3-broker-mod] rpcs3 upgraded to $RPCS3_TARGET_BUILD." \
+            || echo "[rpcs3-broker-mod] WARNING: upgrade failed, using bundled version."
+    fi
+else
+    echo "[rpcs3-broker-mod] rpcs3 is already $RPCS3_TARGET_BUILD."
+fi
+
 # ── sudoers permissions ───────────────────────────────────────────────────────
 chmod 0440 /etc/sudoers.d/broker \
     || { echo "[rpcs3-broker-mod] ERROR: sudoers file missing or chmod failed"; exit 1; }
