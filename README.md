@@ -77,7 +77,7 @@ services:
       - /path/to/romm/library:/romm/library:ro
       - ./rpcs3-cache:/config/rpcs3-cache
     ports:
-      - 3000:3000   # selkies WebRTC stream
+      - 3001:3001   # selkies https WebRTC stream
       - 8000:8000   # broker API
     restart: unless-stopped
 ```
