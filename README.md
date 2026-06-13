@@ -2,7 +2,7 @@
 
 A [linuxserver Docker mod](https://docs.linuxserver.io/general/container-customization/#docker-mods) for [linuxserver/rpcs3](https://docs.linuxserver.io/images/docker-rpcs3/) that adds an HTTP broker for [RomM](https://github.com/rommapp/romm) streaming integration.
 
-Enables RomM to launch PS3 games from ZIP or 7z archives, manage save states, and control audio in a remote streaming session.
+Launch PS3 games from the RomM web UI. The mod extracts the archive, boots rpcs3, and streams the session. Save states and volume control both work.
 
 ## Prerequisites
 
@@ -94,7 +94,7 @@ services:
 | `RPCS3_BOOT_TIMEOUT` | `60.0` | Seconds to wait for rpcs3 to appear after launch |
 | `XDOTOOL_TIMEOUT` | `5.0` | Seconds per xdotool keypress command |
 | `SAVE_WAIT` | `30.0` | Seconds to wait for save state file write to complete |
-| `SAVE_DIR` | `/config/savestates` | rpcs3 save state directory |
+| `SAVE_DIR` | `/config/.config/rpcs3/savestates` | rpcs3 save state directory |
 | `BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ## Broker API
@@ -109,7 +109,7 @@ All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is 
 | `/launch` | POST | `{"rom_path": "..."}` | Boot decrypted `.iso` directly, or extract archive (.zip/.7z/.rar) and launch |
 | `/launch` | DELETE | — | Kill game, return to rpcs3 library view |
 | `/save-state` | POST | — | Send Ctrl+S to rpcs3 |
-| `/load-state` | POST | — | Send Ctrl+R to rpcs3 |
+| `/load-state` | POST | — | Send Ctrl+L to rpcs3 |
 | `/save-and-exit` | POST | — | Save state then return to library |
 | `/cache/{game}` | DELETE | — | Evict game from cache (saves unaffected) |
 | `/volume` | POST | `{"level": 0–100}` | Set PulseAudio sink volume |
@@ -121,12 +121,12 @@ After calling `POST /launch`, poll `GET /status` every 2 seconds. The `launch_st
 
 | `launch_status` | `launch_progress` | Show |
 |---|---|---|
-| `"evicting"` | `null` | Spinner — "Freeing cache space…" |
-| `"extracting"` | `0–100` | Progress bar — "Extracting game files… (45%)" |
-| `"launching"` | `null` | Spinner — "Starting rpcs3…" |
+| `"evicting"` | `null` | Spinner -- "Freeing cache space..." |
+| `"extracting"` | `0–100` | Progress bar -- "Extracting game files... (45%)" |
+| `"launching"` | `null` | Spinner -- "Starting rpcs3..." |
 | `"running"` | `null` | Stream view |
-| `"saving"` | `null` | Spinner — "Saving game…" |
-| `"error"` | `null` | Error — show `launch_detail` |
+| `"saving"` | `null` | Spinner -- "Saving game..." |
+| `"error"` | `null` | Error -- show `launch_detail` |
 
 Cached games skip extraction and go directly to launching. First launch of a large game can take 1–5 minutes while the archive extracts.
 
@@ -136,13 +136,13 @@ Extracted games are stored in `CACHE_DIR`. Set `CACHE_MAX_GB` to enable automati
 
 Most PS3 games are 2–25 GB extracted; plan for 50–200 GB depending on your library. Use 7z archives for best compression (typically 30–50% smaller than ZIP).
 
-In-game saves (`/config/dev_hdd0/`) and save states (`/config/savestates/`) are stored separately and are **never** affected by cache eviction.
+In-game saves (`/config/dev_hdd0/`) and save states (`/config/.config/rpcs3/savestates/`) are stored separately and are **never** affected by cache eviction.
 
 ## Save States
 
-rpcs3 has one save state slot per game. `/save-state` sends Ctrl+S and polls the save state directory for up to `SAVE_WAIT` seconds to confirm the write, then returns `{"status": "saving"}` immediately. **HTTP 200 from `/save-state` means the keypress was delivered — not that the write completed.** Poll `/status` until `launch_status` returns to `"running"` to confirm the save finished. `/load-state` sends Ctrl+R (fire-and-forget — rpcs3 loads immediately).
+rpcs3 has one save state slot per game. `/save-state` sends Ctrl+S and polls the save state directory for up to `SAVE_WAIT` seconds to confirm the write, then returns `{"status": "saving"}` immediately. **HTTP 200 from `/save-state` means the keypress was delivered — not that the write completed.** Poll `/status` until `launch_status` returns to `"running"` to confirm the save finished. `/load-state` sends Ctrl+L (fire-and-forget — rpcs3 loads immediately).
 
-Save states are stored as `<TITLEID>.savestate` files in `SAVE_DIR` (default `/config/savestates/`). They persist across cache evictions and container restarts as long as the `/config` volume is persisted.
+Save states are stored as `.SAVESTAT.zst` files in `SAVE_DIR` (default `/config/.config/rpcs3/savestates/`). They persist across cache evictions and container restarts as long as you persist the `/config` volume.
 
 ## Architecture
 
@@ -166,7 +166,7 @@ svc-broker (S6 longrun) → broker.py
       ├── Discover EBOOT.BIN or .iso boot target
       └── Launch: sudo -u abc /opt/rpcs3/AppRun --no-gui /path/to/boot/target
   └── POST /save-state  → wtype ctrl+s → poll savestates/ for write
-  └── POST /load-state  → wtype ctrl+r (fire-and-forget)
+  └── POST /load-state  → wtype ctrl+l (fire-and-forget)
   └── DELETE /launch    → _return_to_library()
   └── DELETE /cache/X   → shutil.rmtree (saves unaffected)
   └── POST /volume      → pactl set-sink-volume
@@ -182,7 +182,7 @@ Poll `/status` — check `launch_status` and `launch_detail`. If stuck on `"extr
 The archive must contain a decrypted JB folder (with `PS3_DISC.SFB` or `EBOOT.BIN`) or a decrypted `.iso`. Encrypted disc rips will extract but rpcs3 will reject them. Verify the archive structure: `unzip -l game.zip | grep -E "EBOOT|PS3_DISC|\.iso"`.
 
 **Save state not confirmed**
-If `SAVE_WAIT` expires without detecting a file write, the keypress was still delivered — rpcs3 may have saved successfully. Increase `SAVE_WAIT` if saves are large. Check `/config/savestates/` for the `.savestate` file.
+If `SAVE_WAIT` expires without detecting a file write, the keypress was still delivered — rpcs3 may have saved successfully. Increase `SAVE_WAIT` if saves are large. Check `/config/.config/rpcs3/savestates/` for the `.SAVESTAT.zst` file.
 
 **Save/load state not working**
 The broker uses `wtype` to inject Ctrl+S/Ctrl+R into the Wayland session (labwc compositor). If rpcs3 is not the focused window, the keypress may not reach it. In normal streaming use rpcs3 is always the only window and will have focus. Check container logs for `wtype` errors.
