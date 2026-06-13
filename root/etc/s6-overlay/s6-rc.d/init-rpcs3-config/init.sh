@@ -24,14 +24,33 @@ fi
 RPCS3_TARGET_BUILD="0.0.40-19261-e05d3597"
 RPCS3_APPIMAGE_URL="https://github.com/RPCS3/rpcs3-binaries-linux/releases/download/build-e05d35972192f7cb9a3af39dac83d6bd402c6861/rpcs3-v0.0.40-19261-e05d3597_linux64.AppImage"
 RPCS3_APPIMAGE_CACHE="/config/rpcs3-v0.0.40.AppImage"
+RPCS3_APPIMAGE_SHA256="a3cb86719bcf95c45059eddad40f729bd7a5403cb69ebbd487cff7745d0c2dfd"
+
+# Verify the cached AppImage matches the pinned sha256. A truncated download or
+# tampered binary would otherwise be extracted straight into /opt/rpcs3 and run.
+_verify_appimage() {
+    [ -f "$RPCS3_APPIMAGE_CACHE" ] || return 1
+    local actual
+    actual=$(sha256sum "$RPCS3_APPIMAGE_CACHE" | awk '{print $1}')
+    [ "$actual" = "$RPCS3_APPIMAGE_SHA256" ]
+}
 
 _current_build=$(/opt/rpcs3/usr/bin/rpcs3 --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+-\d+-[0-9a-f]+' || true)
 if [[ "$_current_build" != "$RPCS3_TARGET_BUILD"* ]]; then
     echo "[rpcs3-broker-mod] rpcs3 is $_current_build, upgrading to $RPCS3_TARGET_BUILD..."
+    # Drop a stale/corrupt cache before deciding whether to download.
+    if [ -f "$RPCS3_APPIMAGE_CACHE" ] && ! _verify_appimage; then
+        echo "[rpcs3-broker-mod] WARNING: cached AppImage checksum mismatch — re-downloading."
+        rm -f "$RPCS3_APPIMAGE_CACHE"
+    fi
     if [ ! -f "$RPCS3_APPIMAGE_CACHE" ]; then
         echo "[rpcs3-broker-mod] Downloading rpcs3 AppImage..."
         curl -sL -o "$RPCS3_APPIMAGE_CACHE" "$RPCS3_APPIMAGE_URL" \
             || { echo "[rpcs3-broker-mod] ERROR: download failed"; rm -f "$RPCS3_APPIMAGE_CACHE"; }
+    fi
+    if [ -f "$RPCS3_APPIMAGE_CACHE" ] && ! _verify_appimage; then
+        echo "[rpcs3-broker-mod] ERROR: AppImage checksum mismatch after download — refusing to install, using bundled version."
+        rm -f "$RPCS3_APPIMAGE_CACHE"
     fi
     if [ -f "$RPCS3_APPIMAGE_CACHE" ]; then
         chmod +x "$RPCS3_APPIMAGE_CACHE"

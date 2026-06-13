@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 import zipfile as _zipfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
 
@@ -25,6 +25,13 @@ ROM_ROOT           = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 CACHE_DIR          = Path(os.environ.get("CACHE_DIR", "/config/rpcs3-cache"))
 CACHE_MAX_GB       = float(os.environ.get("CACHE_MAX_GB", "0"))
 RPCS3_BOOT_TIMEOUT = float(os.environ.get("RPCS3_BOOT_TIMEOUT", "60.0"))
+
+# rpcs3's stdout/stderr is redirected at fd level to this file. A Python
+# reader thread on a PIPE is not used: if the reader dies, rpcs3 blocks
+# forever once the 64 KB pipe buffer fills.
+RPCS3_LOG_PATH = Path(os.environ.get("RPCS3_LOG_PATH", "/config/rpcs3.log"))
+_LOG_UID = int(os.environ.get("PUID", "1000"))
+_LOG_GID = int(os.environ.get("PGID", "1000"))
 XDOTOOL_TIMEOUT    = float(os.environ.get("XDOTOOL_TIMEOUT", "5.0"))
 SAVE_WAIT          = float(os.environ.get("SAVE_WAIT", "30.0"))
 SAVE_DIR           = Path(os.environ.get("SAVE_DIR", "/config/.config/rpcs3/savestates"))
@@ -77,16 +84,17 @@ _lock = Lock()
 _crash_count = 0          # rapid-crash counter; resets on any launch lasting > 10s
 _MAX_CRASHES  = 5         # stop auto-relaunching after this many rapid crashes
 _session: dict = {
-    "process":          None,
-    "rom_path":         None,
-    "rom_name":         None,
-    "eboot_path":       None,
-    "started_at":       None,
-    "is_managed":       False,
-    "save_in_progress": False,
-    "launch_status":    "idle",   # idle|evicting|extracting|launching|running|saving|error
-    "launch_detail":    None,
-    "launch_progress":  None,
+    "process":           None,
+    "rom_path":          None,
+    "rom_name":          None,
+    "eboot_path":        None,
+    "started_at":        None,
+    "is_managed":        False,
+    "save_in_progress":  False,
+    "launch_in_progress": False,  # guards against concurrent /launch extractions
+    "launch_status":     "idle",   # idle|evicting|extracting|launching|running|saving|error
+    "launch_detail":     None,
+    "launch_progress":   None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -134,15 +142,27 @@ def _resolve_rom_path(p: Path) -> Path | None:
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        _PACTL_CMD + ["pactl"] + list(args),
-        capture_output=True, text=True, timeout=5,
-    )
+    """Run pactl as abc so it connects to abc's PulseAudio instance.
+
+    A hung or missing pactl is reported as a non-zero CompletedProcess (rather
+    than raising) so the /volume and /mute handlers return a 500 instead of
+    dropping the connection with an unhandled exception."""
+    cmd = _PACTL_CMD + ["pactl"] + list(args)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error("pactl timed out: %s", " ".join(args))
+        return subprocess.CompletedProcess(cmd, 124, "", "pactl timed out")
+    except OSError as exc:
+        log.error("pactl failed to run: %s", exc)
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def _pactl_get_mute() -> bool | None:
     result = _pactl("get-sink-mute", "@DEFAULT_SINK@")
     if result.returncode != 0:
+        log.error("pactl get-sink-mute failed (rc=%s): %s",
+                  result.returncode, result.stderr.strip())
         return None
     return result.stdout.strip().endswith("yes")
 
@@ -186,8 +206,11 @@ def _kill_rpcs3() -> None:
         pass
 
 
-def _launch_rpcs3_internal(eboot_path: str | None) -> None:
-    """Spawn rpcs3 as abc. Does not kill any existing instance — caller must do that."""
+def _launch_rpcs3_internal(eboot_path: str | None) -> bool:
+    """Spawn rpcs3 as abc. Does not kill any existing instance — caller must do that.
+
+    Returns True if the process was spawned, False if Popen failed. Callers must
+    not mark the session "running" on a False return."""
     global _crash_count
     cmd = [
         "sudo", "-u", "abc", "env",
@@ -199,39 +222,46 @@ def _launch_rpcs3_internal(eboot_path: str | None) -> None:
         cmd += ["--no-gui", eboot_path]
 
     log.info("Launching rpcs3 (boot=%s)", eboot_path or "library")
+
+    # Append mode keeps history across launches. Failure to open is non-fatal:
+    # rpcs3 still launches, just without captured output.
+    log_fh = None
+    try:
+        log_fh = open(RPCS3_LOG_PATH, "ab", buffering=0)
+        try:
+            os.chown(RPCS3_LOG_PATH, _LOG_UID, _LOG_GID)
+        except (OSError, PermissionError):
+            pass
+        log_fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} launch (boot={eboot_path or 'library'}) ===\n".encode())
+        log_fh.flush()
+    except OSError as exc:
+        log.warning("Cannot open %s for rpcs3 output capture (%s); continuing without capture.", RPCS3_LOG_PATH, exc)
+
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=log_fh if log_fh else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
             preexec_fn=os.setpgrp,
-            text=True,
         )
     except Exception as exc:
         log.error("Failed to launch rpcs3: %s", exc)
         with _lock:
             _session["process"] = None
             _session["is_managed"] = False
-        return
+        return False
+    finally:
+        # Popen dup'd the fd; close our handle so it isn't leaked.
+        if log_fh:
+            log_fh.close()
 
     with _lock:
         _session["process"] = proc
         _session["is_managed"] = True
         _crash_count = 0
     log.info("rpcs3 launched (PID %d)", proc.pid)
-    Thread(target=_log_rpcs3_output, args=(proc,), daemon=True).start()
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
-
-
-def _log_rpcs3_output(proc) -> None:
-    """Forward rpcs3 stdout/stderr lines to the broker log."""
-    try:
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                log.info("[rpcs3] %s", line)
-    except Exception:
-        pass
+    return True
 
 
 def _monitor_process(proc, start_time: float) -> None:
@@ -249,28 +279,30 @@ def _monitor_process(proc, start_time: float) -> None:
         return
 
     rapid = duration < 10
-    if rapid:
-        _crash_count += 1
-    else:
-        _crash_count = 0
+    with _lock:
+        if rapid:
+            _crash_count += 1
+        else:
+            _crash_count = 0
+        crashes = _crash_count
 
-    if _crash_count >= _MAX_CRASHES:
+    if crashes >= _MAX_CRASHES:
         log.error(
             "rpcs3 crashed %d times rapidly — stopping auto-relaunch. "
             "Check firmware installation and container logs.",
-            _crash_count,
+            crashes,
         )
         with _lock:
             _session["is_managed"]   = False
             _session["launch_status"] = "error"
             _session["launch_detail"] = (
-                f"rpcs3 crashed {_crash_count} times rapidly — "
+                f"rpcs3 crashed {crashes} times rapidly — "
                 "check firmware and container logs"
             )
         return
 
     wait_time = 5 if rapid else 1
-    log.info("rpcs3 exited after %.1fs — relaunching library in %ds (crash #%d)", duration, wait_time, _crash_count)
+    log.info("rpcs3 exited after %.1fs — relaunching library in %ds (crash #%d)", duration, wait_time, crashes)
     time.sleep(wait_time)
 
     with _lock:
@@ -509,8 +541,18 @@ def _wait_for_rpcs3_window(timeout: float) -> bool:
     return False
 
 
-def _finish_launch() -> None:
-    """Wait for rpcs3 process to appear, then mark session as running."""
+def _finish_launch(launched: bool) -> None:
+    """Wait for rpcs3 process to appear, then mark session as running.
+
+    If the spawn itself failed (launched=False), mark the session as errored
+    rather than waiting out the boot timeout and falsely reporting "running"."""
+    if not launched:
+        log.error("rpcs3 failed to spawn — marking launch error")
+        with _lock:
+            _session["launch_status"]   = "error"
+            _session["launch_detail"]   = "Failed to start rpcs3 — see container logs"
+            _session["launch_progress"] = None
+        return
     if _wait_for_rpcs3_window(RPCS3_BOOT_TIMEOUT):
         log.info("rpcs3 window detected — marking running")
     else:
@@ -521,7 +563,23 @@ def _finish_launch() -> None:
 
 
 def _do_launch(rom_path: str) -> None:
-    """Background thread: kill current rpcs3, evict LRU, extract archive, launch."""
+    """Background thread entry: run the launch flow, surface any failure via
+    launch_status, and always release the launch_in_progress guard."""
+    try:
+        _do_launch_inner(rom_path)
+    except Exception as exc:
+        log.exception("Launch failed: %s", exc)
+        with _lock:
+            _session["launch_status"]   = "error"
+            _session["launch_detail"]   = f"Launch failed: {exc}"
+            _session["launch_progress"] = None
+    finally:
+        with _lock:
+            _session["launch_in_progress"] = False
+
+
+def _do_launch_inner(rom_path: str) -> None:
+    """Kill current rpcs3, evict LRU, extract archive, launch."""
     archive = Path(rom_path)
     stem = archive.stem
     game_dir = CACHE_DIR / stem
@@ -544,8 +602,7 @@ def _do_launch(rom_path: str) -> None:
             _session["launch_detail"]   = "Starting rpcs3…"
             _session["launch_progress"] = None
         time.sleep(1)
-        _launch_rpcs3_internal(rom_path)
-        _finish_launch()
+        _finish_launch(_launch_rpcs3_internal(rom_path))
         return
 
     # Cache hit
@@ -563,8 +620,7 @@ def _do_launch(rom_path: str) -> None:
                 _session["launch_detail"]   = "Starting rpcs3…"
                 _session["launch_progress"] = None
             time.sleep(1)
-            _launch_rpcs3_internal(str(eboot))
-            _finish_launch()
+            _finish_launch(_launch_rpcs3_internal(str(eboot)))
             return
         log.warning("Cache dir exists but no boot target found — re-extracting")
         shutil.rmtree(game_dir)
@@ -624,8 +680,7 @@ def _do_launch(rom_path: str) -> None:
         _session["launch_progress"] = None
 
     time.sleep(1)
-    _launch_rpcs3_internal(str(eboot))
-    _finish_launch()
+    _finish_launch(_launch_rpcs3_internal(str(eboot)))
 
 
 # ── Save states ───────────────────────────────────────────────────────────────
@@ -730,7 +785,7 @@ def _wtype_load_state() -> bool:
         log.info("wtype: ctrl+l sent")
         return True
     except Exception as exc:
-        log.error("wtype: ctrl+r failed: %s", exc)
+        log.error("wtype: ctrl+l failed: %s", exc)
         return False
 
 
@@ -834,7 +889,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _session["save_in_progress"]:
                     self._send_json(409, {"error": "save in progress"})
                     return
-
             body = self._read_body()
             raw_path = body.get("rom_path", "").strip()
             if not raw_path:
@@ -860,6 +914,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            with _lock:
+                if _session["launch_in_progress"]:
+                    self._send_json(409, {"error": "launch already in progress"})
+                    return
+                _session["launch_in_progress"] = True
             Thread(target=_do_launch, args=(str(resolved),), daemon=True).start()
             self._send_json(200, {"status": "launching", "rom_path": str(resolved)})
             return
@@ -1002,6 +1061,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
+    """SIGTERM/SIGINT: stop accepting requests, let an in-flight save finish,
+    then kill rpcs3 so it isn't orphaned when the broker exits."""
+    log.info("Received signal %d — shutting down", signum)
+    # serve_forever() must be unblocked from another thread.
+    Thread(target=server.shutdown, daemon=True).start()
+
+    deadline = time.monotonic() + max(SAVE_WAIT, 5.0)
+    while time.monotonic() < deadline:
+        with _lock:
+            if not _session["save_in_progress"]:
+                break
+        time.sleep(0.2)
+    else:
+        log.warning("Save still in progress at shutdown deadline — killing rpcs3 anyway")
+
+    _kill_rpcs3()
+
+
 def main():
     log.info("Broker starting — waiting 5s for desktop...")
     time.sleep(5)
@@ -1019,14 +1097,19 @@ def main():
 
     _launch_rpcs3_internal(None)
 
-    server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
+    # Threading server: /save-state polls savestate writes for up to SAVE_WAIT
+    # seconds; a single-threaded server would block /health and /status meanwhile.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("rpcs3 broker listening on port %d", PORT)
     if SECRET:
         log.info("Shared secret auth enabled")
 
+    signal.signal(signal.SIGTERM, lambda signum, frame: _graceful_shutdown(server, signum))
+    signal.signal(signal.SIGINT, lambda signum, frame: _graceful_shutdown(server, signum))
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    finally:
         server.server_close()
 
 
