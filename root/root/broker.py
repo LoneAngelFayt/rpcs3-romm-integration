@@ -768,6 +768,7 @@ def _wtype_save_state() -> bool:
     log.info("wtype: ctrl+s sent — waiting for .SAVESTAT.zst write (max %.1fs)", SAVE_WAIT)
     if not _wait_for_sstate_write(before, time.monotonic() + SAVE_WAIT):
         log.warning("wtype: save state write not confirmed within %.1fs", SAVE_WAIT)
+        return False
     return True
 
 
@@ -806,7 +807,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -822,16 +822,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
-        self.end_headers()
-
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+            return
+
+        # /health stays open for container healthchecks; all other GETs
+        # require the shared secret, matching POST/DELETE.
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
             return
 
         if self.path == "/status":
@@ -885,10 +884,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/launch":
-            with _lock:
-                if _session["save_in_progress"]:
-                    self._send_json(409, {"error": "save in progress"})
-                    return
             body = self._read_body()
             raw_path = body.get("rom_path", "").strip()
             if not raw_path:
@@ -914,7 +909,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            # Check save_in_progress and claim launch_in_progress in the same
+            # lock acquisition — checking them separately lets a save start in
+            # the gap and the launch would then kill rpcs3 mid-savestate.
             with _lock:
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save in progress"})
+                    return
                 if _session["launch_in_progress"]:
                     self._send_json(409, {"error": "launch already in progress"})
                     return
@@ -970,7 +971,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["save_in_progress"] = True
                 _session["launch_status"]    = "saving"
 
-            def _bg_exit():
+            # rpcs3 has a single savestate per game (Ctrl+S), so "slot" is
+            # accepted for API compatibility but ignored.
+            body = self._read_body()
+            wait = body.get("wait", True)
+
+            def _save_then_exit() -> bool:
+                ok = False
                 try:
                     ok = _wtype_save_state()
                     if not ok:
@@ -984,9 +991,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     _return_to_library()
                 except Exception as exc:
                     log.error("save-and-exit: unexpected error returning to library: %s", exc)
+                return ok
 
-            Thread(target=_bg_exit, daemon=True).start()
-            self._send_json(200, {"status": "queued"})
+            if wait:
+                ok = _save_then_exit()
+                self._send_json(200, {"status": "ok", "saved": ok})
+            else:
+                Thread(target=_save_then_exit, daemon=True).start()
+                self._send_json(200, {"status": "queued"})
             return
 
         if self.path == "/volume":
