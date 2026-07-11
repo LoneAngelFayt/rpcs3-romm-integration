@@ -43,7 +43,13 @@ ENV = {
     "PULSE_RUNTIME_PATH": "/defaults",
     "HOME":               "/config",
     "USER":               "abc",
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
+    # The joystick interposer hooks open() on /dev/input/* and redirects to
+    # selkies Unix sockets. The fake libudev must be preloaded alongside it:
+    # /dev/input is empty in the container, so udev-based enumeration (rpcs3's
+    # Evdev pad handler) finds no devices without it and the virtual pads are
+    # never opened.
+    "LD_PRELOAD":         os.environ.get("LD_PRELOAD")
+                          or "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
 }
 
 # Wayland key injection (wtype) — used for save/load state hotkeys.
