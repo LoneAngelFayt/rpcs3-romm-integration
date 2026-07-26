@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import zipfile as _zipfile
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
@@ -105,17 +106,31 @@ _session: dict = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-_VALID_EXTENSIONS = frozenset({".zip", ".7z", ".rar", ".iso"})
+# What rpcs3 can be pointed at, best first: a folder holding several
+# candidates picks by this order. A decrypted .iso wins because it boots in
+# place with no extraction at all, and .7z beats .zip because a PS3 game
+# compresses far better with it, so there is less to unpack.
+ROM_EXTENSIONS = (".iso", ".7z", ".zip", ".rar")
+
+# Where to look below a game folder. The folder itself first, then one level
+# down. Nothing deeper: a launch must not pay for a full walk of a large set,
+# and anything further down is extras, not the game.
+_ROM_SEARCH_GLOBS = ("*", "*/*")
 
 
 def _validate_rom_path(raw: str) -> Path | None:
+    """Resolve raw to an absolute path and confirm it lives under ROM_ROOT.
+
+    Whether the path is something rpcs3 can actually boot is settled later, by
+    _resolve_rom_file: a game folder carries no extension to check here, and
+    deciding it at this stage would report a folder-organized game as a 400
+    ("outside the library") when it is really a 422 ("nothing bootable here").
+    """
     try:
         p = Path(raw).resolve()
     except (ValueError, OSError):
         return None
     if not p.is_relative_to(ROM_ROOT):
-        return None
-    if p.suffix.lower() not in _VALID_EXTENSIONS:
         return None
     return p
 
@@ -140,11 +155,72 @@ def _resolve_rom_path(p: Path) -> Path | None:
         candidates.append(ROM_ROOT / "roms" / rel)
     for c in candidates:
         log.debug("resolve_rom_path: trying candidate %s", c)
-        if c.suffix.lower() in _VALID_EXTENSIONS and c.is_relative_to(ROM_ROOT) and c.exists():
+        if c.is_relative_to(ROM_ROOT) and c.exists():
             log.debug("resolve_rom_path: candidate exists, using %s", c)
             return c
     log.warning("resolve_rom_path: no file found for %s (tried %s)", p, candidates)
     return None
+
+
+def _resolve_rom_file(path: Path) -> Path | None:
+    """Return what rpcs3 should be pointed at for `path`, or None if there is
+    nothing bootable there.
+
+    RomM addresses a folder-organized game by its folder: `Rom.full_path` is
+    `fs_path/fs_name`, and for a multi-file ROM `fs_name` is the directory. So
+    /launch regularly receives something like `.../roms/ps3/Demon's Souls` for
+    a library laid out one game per folder.
+
+    Three shapes come back, and the launch flow branches on all three:
+      * a file, when the exact archive or .iso was addressed;
+      * the folder itself, when it already holds a decrypted tree, which boots
+        in place with no extraction and no cache entry;
+      * an archive found inside the folder, extracted and cached as usual.
+    """
+    if path.is_file():
+        return path if path.suffix.lower() in ROM_EXTENSIONS else None
+    if not path.is_dir():
+        return None
+    # An already-decrypted game on the share needs no unpacking, so it beats
+    # any archive sitting beside it.
+    if _find_boot_target(path) is not None:
+        return path
+    for pattern in _ROM_SEARCH_GLOBS:
+        try:
+            found = _pick_rom_file(path.glob(pattern))
+        except OSError:
+            # Libraries are routinely NFS mounts, so a stalled or vanished
+            # share surfaces here as an OSError mid-walk. Report it as "no
+            # bootable file" rather than 500-ing the launch.
+            return None
+        if found is not None:
+            return found
+    return None
+
+
+def _pick_rom_file(candidates: Iterable[Path]) -> Path | None:
+    """Best bootable file among `candidates`, by format preference then name."""
+    ranked: list[tuple[int, str, Path]] = []
+    for p in candidates:
+        if p.name.startswith("."):
+            continue
+        ext = p.suffix.lower()
+        if ext not in ROM_EXTENSIONS:
+            continue
+        try:
+            if not p.is_file():
+                continue
+            # A symlink in the folder must not walk the launch out of
+            # ROM_ROOT: _validate_rom_path only vetted the folder itself.
+            real = p.resolve()
+        except OSError:
+            continue
+        if not real.is_relative_to(ROM_ROOT):
+            continue
+        ranked.append((ROM_EXTENSIONS.index(ext), p.name.lower(), real))
+    if not ranked:
+        return None
+    return min(ranked)[2]
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
@@ -594,6 +670,32 @@ def _do_launch_inner(rom_path: str) -> None:
     _kill_rpcs3()
     _drain_gamepad_sockets()
 
+    # A game folder already holding a decrypted tree boots straight off the
+    # library share. Copying it into the cache would double the space a game
+    # costs and buy nothing, since the share is where it already lives, so the
+    # LRU never sees these launches.
+    if archive.is_dir():
+        boot_target = _find_boot_target(archive)
+        if boot_target is None:
+            log.error("No boot target found in %s", archive)
+            with _lock:
+                _session["launch_status"]   = "error"
+                _session["launch_detail"]   = "No boot target found — the folder must hold a decrypted EBOOT.BIN or a decrypted ISO"
+                _session["launch_progress"] = None
+            return
+        log.info("Booting %s in place (boot target: %s)", archive.name, boot_target.name)
+        with _lock:
+            _session["rom_path"]        = rom_path
+            _session["rom_name"]        = archive.name
+            _session["eboot_path"]      = str(boot_target)
+            _session["started_at"]      = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _session["launch_status"]   = "launching"
+            _session["launch_detail"]   = "Starting rpcs3…"
+            _session["launch_progress"] = None
+        time.sleep(1)
+        _finish_launch(_launch_rpcs3_internal(str(boot_target)))
+        return
+
     # Direct ISO: boot in-place — no extraction or caching needed.
     # The ISO must be decrypted (EBOOT.BIN inside starts with SCE magic);
     # encrypted ISOs from disc rips will fail inside rpcs3 with "invalid file".
@@ -899,7 +1001,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             rom_path = _validate_rom_path(raw_path)
             if rom_path is None:
                 self._send_json(400, {
-                    "error": "rom_path must be within ROM_ROOT and end in .zip, .7z, .rar, or .iso",
+                    "error": "rom_path must be within ROM_ROOT",
                     "rom_root": str(ROM_ROOT),
                 })
                 return
@@ -914,6 +1016,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         else str(ROM_ROOT.joinpath(*rom_path.relative_to(ROM_ROOT).parts[1:])),
                 })
                 return
+            # A folder-organized game arrives as its folder; find what rpcs3
+            # can actually be pointed at inside it.
+            rom_file = _resolve_rom_file(resolved)
+            if rom_file is None:
+                self._send_json(422, {
+                    "error": "no bootable ROM file found under rom_path",
+                    "path": str(resolved),
+                    "extensions": list(ROM_EXTENSIONS),
+                })
+                return
+            if rom_file != resolved:
+                log.info("Resolved ROM folder %s to %s", resolved, rom_file)
+            resolved = rom_file
 
             # Check save_in_progress and claim launch_in_progress in the same
             # lock acquisition — checking them separately lets a save start in

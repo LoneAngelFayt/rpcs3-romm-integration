@@ -35,10 +35,10 @@ jobs:
 
       - name: Run unit tests (pytest)
         env:
-          # Flip to 'true' once this repo has a suite. Without it a deleted or
-          # unstaged tests/ directory silently downgrades ci-test to a lint-only
-          # gate and still reports green, which is the failure mode this guards.
-          EXPECT_TESTS: 'false'
+          # This repo has a suite, so a deleted or unstaged tests/ directory is
+          # a mistake, not a not-yet: without this, it would silently downgrade
+          # ci-test to a lint-only gate and still report green.
+          EXPECT_TESTS: 'true'
         run: |
           if ls tests/test_*.py >/dev/null 2>&1; then
             pytest tests/ -q
