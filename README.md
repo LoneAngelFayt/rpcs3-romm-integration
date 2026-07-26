@@ -56,6 +56,20 @@ zip -r "Demon_Souls.zip" "Demon_Souls/"
 
 ZIP/7z/RAR formats report extraction progress (0–100%) to the RomM frontend. 7z is recommended — it typically saves 5–15 GB per game. Direct `.iso` files skip extraction entirely and boot immediately.
 
+### Format 3: Unarchived JB folder
+
+Store the same decrypted folder on the share without archiving it:
+
+```
+Demon_Souls/
+  PS3_DISC.SFB
+  PS3_GAME/
+    USRDIR/
+      EBOOT.BIN
+```
+
+The broker boots the `EBOOT.BIN` in place: no extraction, no progress bar, and nothing written to `CACHE_DIR`, so `CACHE_MAX_GB` and LRU eviction never come into it. This is the fastest option to launch and the most expensive to store — the game occupies its full uncompressed size on the share permanently. Use it for the handful of games you play often and archives for the rest.
+
 ## Usage
 
 ```yaml
@@ -114,6 +128,19 @@ All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is 
 | `/cache/{game}` | DELETE | — | Evict game from cache (saves unaffected) |
 | `/volume` | POST | `{"level": 0–100}` | Set PulseAudio sink volume |
 | `/mute` | POST | `{"mute": true\|false}` or `{}` | Set or toggle mute |
+
+### ROM path resolution
+
+`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a **directory**, for libraries laid out one game per folder (`roms/ps3/Demon's Souls/Demon's Souls.7z`). RomM addresses such a game by its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM `fs_name` is the directory, so the broker looks inside for something bootable: the folder itself first, then one level down.
+
+A directory resolves in one of two ways:
+
+- It holds a decrypted `EBOOT.BIN` tree — the folder boots in place (Format 3 above). Nothing is extracted or cached.
+- It holds an archive or an `.iso` — that file is used, and the normal extract-and-cache path runs. Candidates are ranked by format (`.iso`, `.7z`, `.zip`, `.rar`) and then by name, so a decrypted ISO beats an archive sitting beside it. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen.
+
+The resolved target is what `/status` and the response body report.
+
+A directory with nothing bootable inside returns `422` with the accepted extensions in an `extensions` field, which is a different message from the `422` for a path that does not exist at all. A path outside `ROM_ROOT` is a `400`.
 
 ## RomM Frontend Integration
 
