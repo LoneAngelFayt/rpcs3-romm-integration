@@ -143,6 +143,16 @@ def test_resolve_prefers_7z_over_zip(rom_root):
     assert broker._resolve_rom_file(rom_root / "ps3" / "Game") == sevenz
 
 
+def test_resolve_ranks_a_nested_7z_above_a_top_level_zip(rom_root):
+    """Format preference has to outrank shallowness. A stray .zip loose in the
+    game folder must not win just for sitting a level above the real archive.
+    No .iso here on purpose: one would make _find_boot_target claim the folder
+    before ranking ever runs."""
+    sevenz = _file(rom_root, "ps3/Game/parts/Game.7z")
+    _file(rom_root, "ps3/Game/extras.zip")
+    assert broker._resolve_rom_file(rom_root / "ps3" / "Game") == sevenz
+
+
 def test_resolve_returns_none_for_a_folder_with_nothing_bootable(rom_root):
     _file(rom_root, "ps3/Game/cover.png")
     _file(rom_root, "ps3/Game/notes.txt")
