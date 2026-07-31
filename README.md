@@ -131,12 +131,12 @@ All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is 
 
 ### ROM path resolution
 
-`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a **directory**, for libraries laid out one game per folder (`roms/ps3/Demon's Souls/Demon's Souls.7z`). RomM addresses such a game by its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM `fs_name` is the directory, so the broker looks inside for something bootable, in the folder itself and one level down.
+`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a **directory**, for libraries laid out one game per folder (`roms/ps3/Demon's Souls/Demon's Souls.7z`). RomM addresses such a game by its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file ROM `fs_name` is the directory, so the broker looks inside for something bootable: the folder itself first, then one level down.
 
 A directory resolves in one of two ways:
 
 - It holds a decrypted `EBOOT.BIN` tree — the folder boots in place (Format 3 above). Nothing is extracted or cached.
-- It holds an archive or an `.iso` — that file is used, and the normal extract-and-cache path runs. Everything found across both levels is ranked together by format (`.iso`, `.7z`, `.zip`, `.rar`), then depth, then name, so a `.7z` one level down still beats a stray `.zip` sitting at the top of the folder. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen.
+- It holds an archive or an `.iso` — that file is used, and the normal extract-and-cache path runs. Candidates are ranked by format (`.iso`, `.7z`, `.zip`, `.rar`) and then by name, so a decrypted ISO beats an archive sitting beside it. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen.
 
 The resolved target is what `/status` and the response body report.
 
