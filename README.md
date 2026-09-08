@@ -4,6 +4,45 @@ A [linuxserver Docker mod](https://docs.linuxserver.io/general/container-customi
 
 Launch PS3 games from the RomM web UI. The mod extracts the archive, boots rpcs3, and streams the session. Save states and volume control both work.
 
+## Migrating to webstation (v2)
+
+This per-emulator broker mod is deprecated in favor of [docker-webstation][webstation] running [romm-broker][romm-broker]. It still works today and this repo isn't going away, but it won't get new features and RomM will eventually drop support for `config.yml` containers that don't set `protocol: webstation`.
+
+The reason: one webstation container can serve every platform RomM streams from, instead of one container (and one broker fork) per emulator.
+
+Before, a dedicated container for PS3:
+
+```yaml
+streaming:
+  containers:
+    - platform: ps3
+      host: https://192.168.1.51:3001
+      broker_host: http://192.168.1.51:8000
+      label: RPCS3
+```
+
+After, PS3 nested under a webstation container's `platforms:` map (no `memory_card_sync` — PS3 has no memory card):
+
+```yaml
+streaming:
+  containers:
+    - host: https://192.168.1.56:3010
+      protocol: webstation
+      subfolder: /streaming
+      library_path: /romm
+      label: Emulation station
+      platforms:
+        ps3:
+          emulator: rpcs3
+          label: RPCS3
+```
+
+See RomM's [docs/STREAMING_MIGRATION.md][migration-guide] for the full guide.
+
+[webstation]: https://github.com/linuxserver/docker-webstation
+[romm-broker]: https://github.com/romm-streaming/romm-broker
+[migration-guide]: https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md
+
 ## Prerequisites
 
 rpcs3 requires firmware before games will run. **On first launch, open the container's web interface and install the PS3 firmware:**
